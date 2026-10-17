@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Utlysningsmatcharen</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  :root {
+    --ink: #1a1a1a; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #0f766e; --accent-soft: #ccfbf1; --ok: #16a34a;
+    --warn: #d97706; --bad: #dc2626;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
+    background: #fff; color: var(--ink); overflow: hidden;
+  }
+  #progress { position: fixed; top: 0; left: 0; height: 4px; background: var(--accent);
+    width: 5%; transition: width .6s cubic-bezier(.6,0,.2,1); z-index: 10; }
+  .screen {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    justify-content: center; align-items: flex-start; padding: 8vh 10vw;
+    opacity: 0; transform: translateY(40px); pointer-events: none;
+    transition: opacity .45s ease, transform .45s ease; overflow-y: auto;
+  }
+  .screen.active { opacity: 1; transform: none; pointer-events: auto; }
+  .screen.leaving { opacity: 0; transform: translateY(-40px); }
+  .eyebrow { font-size: 15px; color: var(--accent); font-weight: 600;
+    letter-spacing: .06em; text-transform: uppercase; margin-bottom: 14px; }
+  h0, h1, h2 { font-size: clamp(28px, 4.2vw, 44px); font-weight: 700;
+    line-height: 1.15; max-width: 760px; }
+  p.lead { font-size: clamp(16px, 1.6vw, 20px); color: var(--muted);
+    margin: 18px 0 34px; max-width: 640px; line-height: 1.6; }
+  input[type=text] {
+    font-size: clamp(20px, 2.4vw, 30px); padding: 12px 4px; width: min(620px, 80vw);
+    border: none; border-bottom: 3px solid var(--ink); outline: none;
+    background: transparent; color: var(--ink); transition: border-color .2s;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  input::placeholder { color: #c7cbd1; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px; margin-top: 34px;
+    font-size: 19px; font-weight: 600; padding: 13px 26px; border-radius: 10px;
+    border: none; background: var(--accent); color: #fff; cursor: pointer;
+    transition: transform .12s ease, background .2s;
+  }
+  .btn:hover { transform: translateY(-2px); background: #115e59; }
+  .btn:disabled { opacity: .4; cursor: default; transform: none; }
+  .btn.ghost { background: transparent; color: var(--ink); border: 2px solid var(--ink); }
+  kbd { font: 600 12px/1 ui-monospace, monospace; background: #f3f4f6;
+    border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px;
+    padding: 3px 6px; }
+  .hint { color: var(--muted); font-size: 14px; margin-top: 16px; }
+  .spinner { width: 46px; height: 46px; border-radius: 50%;
+    border: 4px solid var(--accent-soft); border-top-color: var(--accent);
+    animation: spin 1s linear infinite; margin-bottom: 26px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .log { font-size: 15px; color: var(--muted); margin-top: 8px; min-height: 1.6em;
+    max-width: 640px; }
+  .log .line { animation: fadeIn .35s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } }
+
+  /* ---- skärmsläckare: flygande bevis ---- */
+  .sky { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .fly {
+    position: absolute; top: 0; left: 0; max-width: 340px;
+    background: rgba(255,255,255,.92); border: 1.5px solid var(--line);
+    border-left-width: 5px; border-radius: 12px; padding: 12px 16px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.10); backdrop-filter: blur(3px);
+    animation: flyAcross var(--dur, 12s) linear forwards;
+  }
+  .fly .ft { font-weight: 650; font-size: 15px; line-height: 1.25; }
+  .fly .fs { font-size: 12.5px; color: var(--muted); margin-top: 4px;
+    font-style: italic; line-height: 1.35; }
+  @keyframes flyAcross {
+    0%   { transform: translate(105vw, var(--y)) rotate(var(--r));
+           opacity: 0; }
+    6%   { opacity: 1; }
+    85%  { opacity: 1; }
+    100% { transform: translate(-45vw, calc(var(--y) + var(--dy)))
+           rotate(calc(var(--r) * -1)); opacity: 0; }
+  }
+  .fly.page   { border-left-color: var(--accent); }
+  .fly.match  { border-left-color: var(--ink); }
+  .fly.form   { border-left-color: #7c3aed; }
+  .fly.doc    { border-left-color: var(--ink); background: var(--ink); }
+  .fly.doc .ft { color: #fff; } .fly.doc .fs { color: #d1d5db; }
+  .fly.motor  { border-left-color: var(--accent); background: var(--accent-soft); }
+  .fly.req.ok      { border-left-color: var(--ok); }
+  .fly.req.miss    { border-left-color: var(--warn); }
+  .fly.req.mismatch{ border-left-color: var(--bad); }
+  .fly.req.struct  { border-left-color: #9ca3af; }
+  .workzone { position: relative; z-index: 2; }
+  .sky + .workzone h1, .sky + .workzone .log { text-shadow: 0 1px 0 #fff; }
+
+  /* ---- summeringsskärm ---- */
+  .facts { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0 6px; }
+  .fact {
+    background: #fff; border: 1.5px solid var(--line); border-radius: 12px;
+    padding: 10px 16px; min-width: 120px;
+  }
+  .fact b { display: block; font-size: 18px; }
+  .fact span { font-size: 12px; color: var(--muted); }
+  .profilebox {
+    background: var(--accent-soft); border: 1.5px solid var(--line);
+    border-radius: 14px; padding: 18px 22px; max-width: 720px;
+    font-size: 15.5px; line-height: 1.65; margin: 16px 0 26px;
+    max-height: 44vh; overflow-y: auto;
+  }
+  .profilebox .psep { border: none; border-top: 1px solid var(--line);
+    margin: 10px 0; }
+
+  /* ---- krav/presentation-summeringar ---- */
+  .kcard {
+    background: #fff; border: 1.5px solid var(--line); border-radius: 14px;
+    padding: 16px 20px; margin: 14px 0; max-width: 760px;
+  }
+  .kcard .kt { font-weight: 650; font-size: 16.5px; }
+  .kcard .krow { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .kcard .kprev { margin-top: 10px; font-size: 13.5px; color: var(--muted);
+    line-height: 1.5; }
+  .kcard .kprev li { margin: 2px 0; list-style: none; }
+  .kcard .kprev li::before { content: "▸ "; color: var(--accent); }
+  .pill.big { font-size: 13px; padding: 4px 12px; }
+
+  /* ---- levande krav-checklista ---- */
+  #reqlist { margin-top: 20px; text-align: left; }
+  .roundsec { margin-bottom: 26px; }
+  .roundsec h3 { font-size: 17px; margin: 0 0 8px; }
+  .reqrow {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 5px 0; border-bottom: 1px solid #f1f2f4; font-size: 14.5px;
+    animation: fadeIn .3s ease;
+  }
+  .reqrow .ric { flex: 0 0 20px; font-size: 15px; display: inline-flex; }
+  .reqrow .rt { color: #374151; line-height: 1.4; }
+  .reqrow.pending .rt { color: var(--muted); }
+  .mini-spin {
+    width: 13px; height: 13px; border: 2px solid #d9e8e4;
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin 1s linear infinite; margin-top: 3px;
+  }
+  .reqrow.ok .rt { color: #14532d; }
+  .reqrow.mismatch .rt { color: #7f1d1d; }
+  .reqrow.miss .rt { color: #4b5563; }
+
+  /* ---- grupperade krav i ämnessektioner ---- */
+  .amnesec { margin: 22px 0 26px; }
+  .amnehead { font-size: 15px; font-weight: 700; color: var(--accent);
+    text-transform: uppercase; letter-spacing: .04em; margin: 18px 0 6px; }
+  .grow { display: flex; align-items: center; gap: 10px; padding: 8px 0;
+    border-top: 1px solid #eef0f2; cursor: pointer; width: min(760px, 90vw); }
+  .grow .ric { flex: 0 0 20px; font-size: 15px; }
+  .grow .gt { flex: 1; font-size: 15px; line-height: 1.35; color: #1f2937;
+    min-width: 0; }
+  .grow.pending .gt { color: var(--muted); }
+  .gbadges { flex: 0 0 auto; }
+  .dnrb { display: inline-block; font-size: 11px; font-weight: 600;
+    padding: 2px 8px; border-radius: 8px; margin-left: 6px;
+    vertical-align: 1px; }
+  .dnrb.d0 { background: #e0f2f1; color: #0f766e; }
+  .dnrb.d1 { background: #ede9fe; color: #6d28d9; }
+  .dnrb.d2 { background: #fce7f3; color: #be185d; }
+  .grow > .gn { font-size: 12px; font-weight: 700; color: var(--accent); }
+  .grow.open > .gt { font-weight: 650; }
+  .inst { display: flex; gap: 8px; align-items: baseline; padding: 3px 0
+    3px 30px; font-size: 13px; color: var(--muted); border-top: 1px dashed #f1f2f4; }
+  .inst .ric2 { flex: 0 0 16px; font-size: 13px; }
+  .grow:not(.open) .inst { display: none; }
+
+  /* ---- dokument-skelett (Skriver dokumenten) ---- */
+  .docgrid { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 20px; }
+  .doccard {
+    width: 300px; border: 1.5px solid var(--line); border-radius: 14px;
+    padding: 14px 16px; background: #fff; text-align: left;
+    transition: border-color .2s, background .2s, transform .2s;
+  }
+  .doccard .dh { display: flex; align-items: center; gap: 8px;
+    font-weight: 650; font-size: 14.5px; margin-bottom: 10px; }
+  .doccard .dmeta { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .doccard.sk { pointer-events: none; }
+  .skrow { height: 10px; border-radius: 5px; margin: 6px 0;
+    background: linear-gradient(100deg, #ececee 30%, #f5f6f6 50%, #ececee 70%);
+    background-size: 200% 100%; animation: shimmer 1.6s linear infinite; }
+  .skgrid { display: grid; grid-template-columns: 3fr 1fr 2fr; gap: 5px; }
+  .skcell { height: 9px; border-radius: 4px; margin: 3px 0;
+    background: linear-gradient(100deg, #ececee 30%, #f5f6f6 50%, #ececee 70%);
+    background-size: 200% 100%; animation: shimmer 1.6s linear infinite; }
+  @keyframes shimmer { from { background-position: 120% 0; }
+    to { background-position: -80% 0; } }
+  .doccard.ready { border-color: var(--ok); background: #f4fbf6;
+    cursor: pointer; pointer-events: auto; }
+  .doccard.ready:hover { transform: translateY(-2px); }
+  .doccard.ready .dmeta { color: var(--ok); font-weight: 700; }
+  .docround { margin-top: 22px; max-width: 780px; text-align: left; }
+  .docround h3 { font-size: 16px; margin: 0 0 10px; }
+  a.docbtn { text-decoration: none; color: inherit; }
+  .docbtn.ready { border-color: var(--ok); }
+  .docbtn.ready b { color: var(--ok); }
+  .cards { display: flex; flex-direction: column; gap: 12px; width: min(760px, 85vw);
+    margin-top: 10px; }
+  .card {
+    border: 2px solid var(--line); border-radius: 14px; padding: 16px 20px;
+    cursor: pointer; transition: border-color .15s, background .15s; position: relative;
+  }
+  .card:hover { border-color: #9ca3af; }
+  .card.sel { border-color: var(--accent); background: var(--accent-soft); }
+  .card .t { font-weight: 650; font-size: 17px; margin-right: 90px; }
+  .card .m { font-size: 13.5px; color: var(--muted); margin-top: 4px; }
+  .card .v { font-size: 14px; margin-top: 8px; color: #374151; }
+  .card .sim { position: absolute; top: 14px; right: 18px; font-weight: 700;
+    color: var(--accent); font-size: 15px; }
+  .card.dalig { opacity: .55; }
+  .card.dalig .sim { color: var(--muted); }
+  .card .fit { font-size: 12px; font-weight: 600; padding: 3px 10px;
+    border-radius: 999px; display: inline-block; margin-top: 8px; }
+  .fit.bra { background: #dcfce7; color: #166534; }
+  .fit.mojlig { background: #fbf3e4; color: var(--warn); }
+  .fit.dalig { background: #f3f4f6; color: var(--muted); }
+  .pill { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 9px;
+    border-radius: 999px; background: #f3f4f6; color: var(--muted); margin-right: 6px; }
+  .pill.open { background: #dcfce7; color: #166534; }
+  .result { width: min(760px, 85vw); border: 2px solid var(--line); border-radius: 14px;
+    padding: 18px 22px; margin: 10px 0; }
+  .result .row { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .stat { font-size: 14px; font-weight: 600; }
+  .stat.ok { color: var(--ok);} .stat.warn { color: var(--warn);} .stat.bad { color: var(--bad);}
+  .docs { display: flex; gap: 14px; margin-top: 18px; flex-wrap: wrap; }
+  .docbtn { display: flex; flex-direction: column; gap: 6px; border: 2px solid var(--ink);
+    border-radius: 14px; padding: 18px 22px; cursor: pointer; min-width: 240px;
+    background: #fff; transition: transform .12s ease; text-align: left;
+    font: inherit; color: inherit; }
+  .docbtn:hover { transform: translateY(-2px); }
+  .docbtn b { font-size: 17px; } .docbtn span { font-size: 13px; color: var(--muted); }
+  .docview { width: min(860px, 85vw); max-height: 46vh; overflow-y: auto;
+    border: 1px solid var(--line); border-radius: 14px; padding: 26px 30px;
+    margin-top: 18px; font-size: 15px; line-height: 1.65; background: #fcfcfd; }
+  .docview h1 { font-size: 24px; } .docview h2 { font-size: 20px; margin-top: 1em; }
+  .docview h3 { font-size: 16.5px; margin-top: 1em; }
+  .docview table { border-collapse: collapse; font-size: 13px; margin: 10px 0; }
+  .docview td, .docview th { border: 1px solid var(--line); padding: 5px 9px; vertical-align: top; }
+  .docview blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--muted); }
+  .docview code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  .footer-nav { position: fixed; bottom: 26px; right: 36px; display: flex; gap: 10px; }
+  .navbtn { width: 44px; height: 44px; border-radius: 10px; border: 1.5px solid var(--line);
+    background: #fff; font-size: 18px; cursor: pointer; color: var(--ink); }
+  .navbtn:hover { border-color: var(--ink); }
+  #org-suggest { position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+    background: #fff; border: 1.5px solid var(--line); border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.16); z-index: 9; overflow: hidden;
+    display: none; }
+  #org-suggest .sg { padding: 10px 16px; cursor: pointer; font-size: 14px;
+    display: flex; gap: 12px; align-items: baseline; }
+  #org-suggest .sg:hover { background: var(--accent-soft); }
+  #org-suggest .sg b { min-width: 105px; font-weight: 650; }
+  #org-suggest .sg span { color: var(--muted); font-size: 12.5px; }
+  #org-confirm { font-size: 13px; color: var(--ok); margin-top: 7px;
+    display: none; }
+  @media (max-width: 700px) { .screen { padding: 6vh 7vw; } }
+</style>
+</head>
+<body>
+<div id="progress"></div>
+
+<!-- 1: URL -->
+<section class="screen active" id="s-url">
+  <div class="eyebrow">Vinnova-matcharen · demo</div>
+  <h1>Hej! Vilken webbplats hör bolaget till?</h1>
+  <p class="lead">Vi skrapar sidan i bakgrunden, bygger en profil och matchar mot
+    korpusets alla ansökningsomgångar — bara de som ligger framåt i tiden.</p>
+  <input type="text" id="inp-url" placeholder="t.ex. dittbolag.se" autofocus
+         enterkeyhint="go">
+  <div id="org-wrap" style="position:relative; width:min(420px,80vw); margin-top:18px">
+    <input type="text" id="inp-orgnr" placeholder="bolagsnamn eller org.nr 556xxx-xxxx (autocomplete)"
+           style="font-size:16px; border-bottom-width:2px; width:100%">
+    <div id="org-suggest"></div>
+    <div id="org-confirm"></div>
+  </div>
+  <button class="btn" id="btn-start">Nästa ↵</button>
+  <div class="hint">tryck <kbd>Enter</kbd> för att gå vidare</div>
+</section>
+
+<!-- 2: skrapar/matchar -->
+<section class="screen" id="s-work">
+  <div class="sky" id="sky-work"></div>
+  <div class="workzone">
+    <div class="spinner"></div>
+    <h1 id="work-title">Skrapar din webbplats…</h1>
+    <div class="log" id="work-log"></div>
+  </div>
+</section>
+
+<!-- 3: summering av bolaget -->
+<section class="screen" id="s-summary">
+  <div class="eyebrow">Sammanfattning</div>
+  <h1>Vad vi lärde oss om <span id="sum-name">bolaget</span></h1>
+  <div class="facts" id="sum-facts"></div>
+  <div class="profilebox" id="sum-profile"></div>
+  <button class="btn" id="btn-summary">Stämmer — visa mina utlysningar ↵</button>
+  <button class="btn ghost" id="btn-summary-back" onclick="location.reload()"
+    style="margin-left:10px">Börja om</button>
+  <div class="hint">underlag: er webbplats + offentliga register</div>
+</section>
+
+<!-- 4: val -->
+<section class="screen" id="s-pick">
+  <div class="eyebrow" id="pick-company">Matchning</div>
+  <h2>Dessa ligger framåt i tiden — vilka låter roliga?</h2>
+  <p class="lead">Kryssa för upp till tre omgångar så analyserar vi kraven och
+    letar bevis i din textmassa.</p>
+  <div class="cards" id="cards"></div>
+  <button class="btn" id="btn-pick" disabled>Analysera valda ↵</button>
+  <div class="hint"><span id="pick-count">0</span> valda (max 3)</div>
+</section>
+
+<!-- 4: kravsummering -->
+<section class="screen" id="s-kravsum">
+  <div class="eyebrow">Steg 1 av bevisarbetet</div>
+  <h1>Kraven vi har identifierat</h1>
+  <div id="kravsum-list"></div>
+  <div style="margin-top:26px">
+    <button class="btn ghost" id="btn-kravsum-back">← Ändra val</button>
+    <button class="btn" id="btn-kravsum-go" style="margin-left:10px">Gå vidare — leta bevis ↵</button>
+  </div>
+  <div class="hint">bevissökningen tar 1–2 minuter per omgång</div>
+</section>
+
+<!-- 5: analys -->
+<section class="screen" id="s-analysis" style="overflow-y:auto">
+  <div class="sky" id="sky-analysis"></div>
+  <div class="workzone" style="max-width:820px">
+    <h1 id="analysis-title" style="font-size: clamp(26px, 4vw, 38px)">
+      Samlar kravbilden och letar bevis…</h1>
+    <div class="log" id="analysis-log" style="min-height:0"></div>
+    <div id="reqlist"></div>
+  </div>
+</section>
+
+<!-- 6: bevissummering -->
+<section class="screen" id="s-bevissum">
+  <div class="eyebrow">Steg 2 av bevisarbetet</div>
+  <h1>Bevisläget innan dokumenten</h1>
+  <div id="bevissum-list"></div>
+  <div style="margin-top:26px">
+    <button class="btn ghost" id="btn-bevis-back">← Tillbaka till valet</button>
+    <button class="btn" id="btn-bevis-go" style="margin-left:10px">Ta fram dokumenten ↵</button>
+  </div>
+  <div class="hint">dokumenten är utkast för mänsklig granskning</div>
+</section>
+
+<!-- 7: resultat -->
+<section class="screen" id="s-result">
+  <div class="eyebrow">Färdigt</div>
+  <h2 id="result-title">Här är bevisläget och dokumenten</h2>
+  <div id="result-list"></div>
+  <div id="result-docs"></div>
+  <div class="docview" id="docview" hidden></div>
+  <div class="docs" id="download-row" hidden>
+    <a class="btn ghost" id="dl-md" download>Ladda ner markdown</a>
+  </div>
+  <div class="hint">tryck <kbd>r</kbd> för att börja om</div>
+</section>
+
+<!-- fel -->
+<section class="screen" id="s-error">
+  <div class="eyebrow" style="color:var(--bad)">Något gick fel</div>
+  <h1>Hoppsan.</h1>
+  <p class="lead" id="error-msg"></p>
+  <button class="btn ghost" onclick="location.reload()">Börja om</button>
+</section>
+
+<div class="footer-nav">
+  <button class="navbtn" id="nav-up">↑</button>
+  <button class="navbtn" id="nav-down">↓</button>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const screens = ["s-url","s-work","s-summary","s-pick","s-kravsum",
+  "s-analysis","s-bevissum","s-result"];
+let current = 0, jobId = null, pollTimer = null, sel = new Set();
+let docs = null, showing = null, lastItem = 0, lastJob = null;
+
+/* ---- skärmsläckare: flygande bevis-kort ---- */
+const STATUS_ICON = { styrkt_uppfyllt: "✅", okant: "⚪",
+  styrkt_ej_uppfyllt: "⚠️", strukturellt: "📋" };
+function cardClass(it) {
+  if (it.kind === "req") return "fly req " +
+    ({ styrkt_uppfyllt: "ok", okant: "miss",
+       styrkt_ej_uppfyllt: "mismatch", strukturellt: "struct" }[it.status] || "miss");
+  return "fly " + (it.kind || "match");
+}
+function spawnCard(it) {
+  const sky = document.querySelector(".screen.active .sky") ||
+              document.querySelector(".sky");
+  if (!sky) return;
+  const el = document.createElement("div");
+  el.className = cardClass(it);
+  const icon = it.kind === "req" ? (STATUS_ICON[it.status] || "") + " "
+    : it.kind === "page" ? "🌐 " : it.kind === "match" ? "🎯 "
+    : it.kind === "form" ? "❓ " : it.kind === "motor" ? "⚙️ "
+    : it.kind === "bolagsreg" ? "⚖️ " : it.kind === "kravlista" ? "📑 " : "";
+  el.innerHTML =
+    `<div class="ft">${icon}${(it.title || "").replace(/</g, "&lt;")}</div>` +
+    (it.sub ? `<div class="fs">${it.sub.replace(/</g, "&lt;")}</div>` : "");
+  el.style.setProperty("--y", (5 + Math.random() * 75) + "vh");
+  el.style.setProperty("--dy", (Math.random() * 14 - 7) + "vh");
+  el.style.setProperty("--r", (Math.random() * 6 - 3).toFixed(1) + "deg");
+  el.style.setProperty("--dur", (9 + Math.random() * 7).toFixed(1) + "s");
+  if (sky.children.length > 13) sky.firstChild.remove();
+  el.addEventListener("animationend", () => el.remove());
+  sky.appendChild(el);
+}
+let cardQueue = [];
+setInterval(() => {
+  if (!cardQueue.length) return;
+  const active = document.querySelector(".screen.active .sky");
+  if (!active) { cardQueue = []; return; }
+  const it = cardQueue.shift();
+  // sammanfattning/val-skärm: visa bara "milda" bevis (match + sida)
+  const onPick = document.getElementById("s-pick").classList.contains("active");
+  if (onPick && it.kind === "req") return;
+  spawnCard(it);
+}, 900);
+function feedItems(j) {
+  const items = j.items || [];
+  const nytt = items.slice(lastItem);
+  // krav-items uppdaterar checklistan, doc_done aktiverar skelett-kort —
+  // övriga flyger som bevinskort
+  const tillKort = nytt.filter(it => {
+    if (it.kind === "req") { setReqStatus(it.dnr, it.id, it.status); return false; }
+    if (it.kind === "doc_done") applyDocDone(it);
+    return true;
+  });
+  cardQueue.push(...tillKort);
+  lastItem = items.length;
+}
+
+/* ---- levande krav-checklista under analysen ---- */
+const REQ_CLASS = { styrkt_uppfyllt: "ok", okant: "miss",
+  styrkt_ej_uppfyllt: "mismatch", strukturellt: "miss" };
+const REQ_GLYPH = { styrkt_uppfyllt: "✅", okant: "⚪",
+  styrkt_ej_uppfyllt: "⚠️", strukturellt: "📋" };
+let reqTotal = 0, reqDone = 0, idxMap = {};
+const VÄRSTA = ["styrkt_ej_uppfyllt", "okant", "strukturellt",
+                "styrkt_uppfyllt"];
+function buildChecklista(j) {
+  reqTotal = 0; reqDone = 0; idxMap = {};
+  const el = $("reqlist"); el.innerHTML = "";
+  const grupper = j.grupper || [];
+  const dnrfärg = {};
+  grupper.forEach(g => g.dnrs.forEach(d => {
+    if (!(d in dnrfärg)) dnrfärg[d] = Object.keys(dnrfärg).length % 3;
+  }));
+  let amne = null, sec = null;
+  grupper.forEach(g => {
+    if (g.amne !== amne) {
+      amne = g.amne;
+      sec = document.createElement("div"); sec.className = "amnesec";
+      sec.innerHTML = `<div class="amnehead">${amne}</div>`;
+      el.appendChild(sec);
+    }
+    const grow = document.createElement("div");
+    grow.className = "grow pending";
+    grow._count = g.forekomster.length;
+    grow._states = {};
+    const badges = g.forekomster.map(f =>
+      `<span class="dnrb d${dnrfärg[f.dnr]}">${f.dnr}</span>`).join("");
+    const n = g.forekomster.length;
+    grow.innerHTML =
+      `<span class="ric"><span class="mini-spin"></span></span>
+       <span class="gt">${g.text.replace(/</g,"&lt;")}</span>
+       ${n > 1 ? `<span class="gn">×${n}</span>` : ""}
+       <span class="gbadges">${badges}</span>`;
+    if (n > 1) {
+      g.forekomster.forEach((f, i) => {
+        const inst = document.createElement("div");
+        inst.className = "inst";
+        inst.id = `req-${f.dnr}-${f.id}`;
+        inst.innerHTML =
+          `<span class="ric2"><span class="mini-spin"></span></span>
+           <span class="dnrb d${dnrfärg[f.dnr]}">${f.dnr}</span>
+           <span>${f.text.replace(/</g,"&lt;")}</span>`;
+        grow.insertAdjacentElement("afterend", inst);
+        inst.classList.forEach((c) => {});
+        inst.style.display = "none";
+        grow.addEventListener("click", () =>
+          inst.style.display = inst.style.display === "none" ? "" : "none");
+      });
+    }
+    grow.title = n > 1 ? "klicka för att se varianterna" : g.forekomster[0].id;
+    sec.appendChild(grow);
+    g.forekomster.forEach(f => {
+      reqTotal++;
+      idxMap[`${f.dnr}:${f.id}`] = { grow, inst: $(`req-${f.dnr}-${f.id}`) };
+    });
+  });
+  updateReqCounter();
+}
+function setReqStatus(dnr, id, status) {
+  const rec = idxMap[`${dnr}:${id}`];
+  if (!rec || rec.grow._states[id]) return;
+  rec.grow._states[id] = status;
+  const inst = rec.inst || rec.grow;      // ensamt krav: uppdatera gruppraden
+  if (rec.inst || rec.grow._count === 1) {
+    const ir = rec.inst;
+    if (ir) {
+      ir.querySelector(".ric2").textContent = REQ_GLYPH[status] || "—";
+      ir.style.color = { ok: "#14532d", mismatch: "#7f1d1d" }[REQ_CLASS[status]] || "";
+    }
+  }
+  const states = Object.values(rec.grow._states);
+  if (states.length === rec.grow._count) {
+    const worst = VÄRSTA.find(s => states.includes(s));
+    rec.grow.classList.remove("pending");
+    rec.grow.classList.add(REQ_CLASS[worst] || "miss");
+    const ric = rec.grow.querySelector(".ric");
+    ric.innerHTML = ""; ric.textContent = REQ_GLYPH[worst] || "—";
+  }
+  reqDone++; updateReqCounter();
+}
+
+const PROG = {"s-url":5,"s-work":20,"s-summary":32,"s-pick":45,
+  "s-kravsum":55,"s-analysis":70,"s-bevissum":85,"s-result":100};
+
+function show(id) {
+  document.querySelectorAll(".screen").forEach(s => {
+    if (s.id === id) { s.classList.remove("leaving"); s.classList.add("active"); }
+    else if (s.classList.contains("active")) { s.classList.remove("active"); s.classList.add("leaving"); }
+  });
+  $("progress").style.width = (PROG[id] || 5) + "%";
+  current = screens.indexOf(id);
+}
+function fail(msg) { $("error-msg").textContent = msg || "Okänt fel."; show("s-error"); }
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail || r.statusText);
+  return r.json();
+}
+
+// ---- autocomplete mot Bolagsverkets register
+let orgTimer = null;
+$("inp-orgnr").addEventListener("input", e => {
+  const v = e.target.value.trim();
+  $("org-confirm").style.display = "none";
+  clearTimeout(orgTimer);
+  if (v.length < 2) { $("org-suggest").style.display = "none"; return; }
+  orgTimer = setTimeout(async () => {
+    try {
+      const r = await api("/api/bolag?q=" + encodeURIComponent(v));
+      const list = r["träffar"] || [];
+      const sg = $("org-suggest");
+      if (!list.length) { sg.style.display = "none"; return; }
+      sg.innerHTML = list.map((x, i) =>
+        `<div class="sg" data-org="${x.orgnr}" data-namn="${(x.namn||'').replace(/"/g,'&quot;')}">
+           <b>${x.orgnr}</b> <span>${x.namn}</span>
+           <span style="margin-left:auto">${x.form || ''}${x.grundat_ar ? ' · ' + x.grundat_ar : ''}${x.ort ? ' · ' + x.ort : ''}</span>
+         </div>`).join("");
+      sg.querySelectorAll(".sg").forEach(el => {
+        el.onclick = () => {
+          $("inp-orgnr").value = el.dataset.org;
+          sg.style.display = "none";
+          const cf = $("org-confirm");
+          cf.textContent = `⚖️ ${el.dataset.namn} — direkt från Bolagsverkets register`;
+          cf.style.display = "block";
+        };
+      });
+      sg.style.display = "block";
+    } catch (e2) { /* autocomplete optionally */ }
+  }, 250);
+});
+document.addEventListener("click", e => {
+  if (!document.getElementById("org-wrap").contains(e.target))
+    $("org-suggest").style.display = "none";
+});
+
+// ---- steg 1: starta
+async function start() {
+  const url = $("inp-url").value.trim();
+  if (!url) { $("inp-url").focus(); return; }
+  const orgnr = $("inp-orgnr").value.trim() || null;
+  $("work-log").innerHTML = ""; $("work-title").textContent = "Skrapar din webbplats…";
+  lastItem = 0;
+  show("s-work");
+  try {
+    const r = await api("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({url, orgnr})});
+    jobId = r.job_id;
+    poll("match");
+  } catch (e) { fail(e.message); }
+}
+
+// ---- polling under skrapa+matchning (+ bakgrundspoll på val- och resultatskärm)
+function poll(kontext) {
+  clearInterval(pollTimer);
+  const logEl = kontext === "match" ? $("work-log")
+              : kontext === "analys" ? $("analysis-log") : null;
+  pollTimer = setInterval(async () => {
+    try {
+      const j = await api("/api/job/" + jobId);
+      if (logEl) {
+        logEl.innerHTML = (j.log||[]).map(l => `<div class="line">${l}</div>`).join("");
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      feedItems(j);
+      if (j.phase === "fel") { clearInterval(pollTimer); fail(j.error); return; }
+      if (kontext === "match" && j.phase === "valet") {
+        clearInterval(pollTimer); lastJob = j; visaSummary(j);
+      }
+      if (kontext === "krav" && j.phase === "kravsum") {
+        clearInterval(pollTimer); lastJob = j; renderKravSum(j);
+      }
+      if (kontext === "analys" && j.phase === "bevissum") {
+        clearInterval(pollTimer); lastJob = j; renderBevisSum(j);
+      }
+      if (kontext === "fortsatt" && j.phase === "klar") {
+        clearInterval(pollTimer); visorResultat(j);
+      }
+      if (kontext === "analys" && j.phase === "dokumenterar")
+        $("analysis-title").textContent = "Skriver dokumenten…";
+    } catch (e) { clearInterval(pollTimer); fail(e.message); }
+  }, 1500);
+}
+
+// ---- steg 1.5: vad vi lärde oss om bolaget
+function visaSummary(j) {
+  $("sum-name").textContent = j.company || "bolaget";
+  const f = j.nyckelfakta || {};
+  const fmtTkr = v => v >= 1000000 / 1000 ? (v / 1000).toFixed(1).replace(".", ",")
+    + " mkr" : v.toLocaleString("sv-SE") + " tkr";
+  const chips = [];
+  if (f.namn && f.register_driven) chips.push(["Namn (registret)", f.namn]);
+  if (f.orgnr) chips.push(["Org.nr", f.orgnr]);
+  if (f.form) chips.push(["Bolagsform", f.form]);
+  if (f.grundat) chips.push(["Grundat", f.grundat]);
+  if (f.antal_anstallda != null) chips.push(["Anställda", f.antal_anstallda]);
+  if (f.omsattning_tkr) chips.push(["Omsättning", fmtTkr(f.omsattning_tkr)]);
+  if (f.ort) chips.push(["Ort", f.ort]);
+  if (f.likvidation === true) chips.push(["⚠️ Juridisk status", "i likvidation/rekonstruktion"]);
+  else if (f.register_driven) chips.push(["Juridisk status", "aktiv"]);
+  $("sum-facts").innerHTML = chips.length
+    ? chips.map(([k, v]) => `<div class="fact"><b>${v}</b><span>${k}</span></div>`).join("")
+    : `<div class="fact"><b>📄</b><span>bolagsregistret gav ingen träff —
+       vi baserar på webbplatsen</span></div>`;
+  const källa = f.kalla ? `underlag: er webbplats + ${f.kalla}`
+    : "underlag: er webbplats + offentliga register";
+  $("s-summary").querySelector(".hint").textContent = källa +
+    (f.register_driven ? " (Bolagsverkets officiella register)" : "");
+  $("sum-profile").innerHTML = (j.profil || "Kunde inte sammanfatta bolaget.")
+    .replace(/</g, "&lt;")
+    .split("\n")
+    .map(r => r.trim() ? `<div>${r}</div>` : "<hr class='psep'>")
+    .join("");
+  show("s-summary");
+}
+$("btn-summary").onclick = () => { if (lastJob) visorVal(lastJob); };
+
+// ---- steg 2: välj omgångar
+function visorVal(j) {
+  $("pick-company").textContent = "Matchning för " + (j.company || "bolaget") +
+    (j.orgnr ? " · org.nr " + j.orgnr : "");
+  const el = $("cards"); el.innerHTML = ""; sel.clear();
+  (j.matches||[]).forEach(m => {
+    const c = document.createElement("div");
+    const poang = m.matchpoang ?? Math.round((m.similarity||0)*100);
+    const dalig = m.passform === "dalig";
+    c.className = "card" + (dalig ? " dalig" : "");
+    const FIT = { bra: "passar bra", mojlig: "kan passa",
+                  dalig: "passar troligen ej", ej_bedombar: "ej bedömbar" };
+    c.innerHTML = `<div class="sim">${poang}%</div>
+      <div class="t">${m.title}</div>
+      <div class="m"><span class="pill ${m.can_apply_now?'open':''}">${m.can_apply_now?'öppen nu':m.state}</span>
+        <span class="pill">stänger ${String(m.closing_date||'').slice(0,10)}</span>
+        <span class="pill">${m.funder||''}</span></div>
+      ${m.passform ? `<span class="fit ${m.passform}">${FIT[m.passform]||m.passform}</span>` : ""}
+      <div class="v">${m.varfor||''}</div>`;
+    c.onclick = () => {
+      if (sel.has(m.dnr)) { sel.delete(m.dnr); c.classList.remove("sel"); }
+      else if (sel.size < 3) { sel.add(m.dnr); c.classList.add("sel"); }
+      $("pick-count").textContent = sel.size;
+      $("btn-pick").disabled = sel.size === 0;
+      $("btn-pick").textContent = "Analysera valda ↵";
+    };
+    el.appendChild(c);
+  });
+  show("s-pick");
+  poll("pick");          // bevisen fortsätter flyga i bakgrunden
+}
+
+// ---- steg 3: analys
+$("btn-pick").onclick = async () => {
+  if (sel.size === 0) return;
+  const b = $("btn-pick");
+  b.disabled = true; b.textContent = "Hämtar kraven …";
+  try {
+    await api("/api/select", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({job_id: jobId, dnrs: [...sel]})});
+    poll("krav");
+  } catch (e) { fail(e.message); b.disabled = false; }
+};
+
+// ---- kravsummering (grinden efter valet)
+function renderKravSum(j) {
+  const el = $("kravsum-list"); el.innerHTML = "";
+  (j.kravsum || []).forEach(k => {
+    const c = document.createElement("div");
+    c.className = "kcard";
+    c.innerHTML = `<div class="row"><div class="kt">${k.title}</div>
+        <div class="sim" style="margin-left:auto">${(k.similarity*100).toFixed(0)}%</div></div>
+      <div class="krow">
+        <span class="pill">${k.dnr}</span>
+        <span class="pill">stänger ${String(k.closing_date||'').slice(0,10)}</span>
+        <span class="pill big"><b>${k.n_relevanta}</b>&nbsp;relevanta krav av ${k.n_krav_totalt} i korpuset</span>
+      </div>
+      ${k.varfor ? `<div class="kprev" style="margin-top:8px"><i>${k.varfor}</i></div>` : ""}
+      <ul class="kprev">${k.krav_preview.map(r =>
+        `<li>${r.text.length > 130 ? r.text.slice(0,130) + "…" : r.text}</li>`).join("")}</ul>`;
+    el.appendChild(c);
+  });
+  $("btn-kravsum-go").textContent =
+    `Gå vidare — leta bevis (${(j.kravsum||[]).length} omgångar) ↵`;
+  show("s-kravsum");
+}
+$("btn-kravsum-back").onclick = () => { show("s-pick"); };
+$("btn-kravsum-go").onclick = async () => {
+  buildChecklista(lastJob || {});
+  $("analysis-title").textContent = "Letar bevis i er textmassa…";
+  show("s-analysis");
+  try {
+    await api("/api/analysera", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({job_id: jobId})});
+    poll("analys");
+  } catch (e) { fail(e.message); }
+};
+
+// ---- bevissummering (grinden efter faktainhämtningen)
+function renderBevisSum(j) {
+  const el = $("bevissum-list"); el.innerHTML = "";
+  (j.results || []).forEach(r => {
+    const c = document.createElement("div");
+    c.className = "kcard";
+    const mot = r.motor && r.motor.eligible != null
+      ? `<span class="pill big" style="border-color:var(--${r.motor.eligible?'ok':'bad'});color:var(--${r.motor.eligible?'ok':'bad'})">regelmotor: eligible=${r.motor.eligible}</span>` : "";
+    c.innerHTML = `<div class="kt">${r.title}</div>
+      <div class="krow">
+        <span class="pill">${r.dnr}</span>${mot}
+        <span class="stat ok">✅ ${r.stats.styrkt_uppfyllt||0} styrkta</span>
+        <span class="stat warn">❓ ${r.stats.okant||0} luckor</span>
+        <span class="stat bad">❌ ${r.stats.styrkt_ej_uppfyllt||0} felmatch</span>
+        <span class="stat">🔧 ${r.stats.strukturellt||0} strukturkrav</span>
+      </div>`;
+    el.appendChild(c);
+  });
+  show("s-bevissum");
+}
+$("btn-bevis-back").onclick = () => { show("s-pick"); };
+/* ---- dokument-skelett ---- */
+function renderDocSkeletons(results) {
+  let wrap = $("docskel");
+  if (!wrap) {
+    wrap = document.createElement("div");
+    wrap.id = "docskel";
+    $("reqlist").parentElement.appendChild(wrap);
+  }
+  wrap.innerHTML = "<h3 style='margin:10px 0 2px'>Dokument som tas fram — per ansökan:</h3>";
+  (results || []).forEach(r => {
+    const grp = document.createElement("div"); grp.className = "docround";
+    grp.innerHTML = `<h3>${r.title} <span class="pill">${r.dnr}</span></h3>
+      <div class="docgrid">
+        <div class="doccard sk" id="doc-${r.dnr}-excel">
+          <div class="dh">📊 Kravmatris.xlsx <span class="dmeta">byggs…</span></div>
+          <div class="skgrid">${"<div class='skcell'></div>".repeat(12)}</div>
+        </div>
+        <div class="doccard sk" id="doc-${r.dnr}-ansokan">
+          <div class="dh">📝 Ansökningshandling.md <span class="dmeta">skrivs…</span></div>
+          <div class="skrow" style="width:92%"></div><div class="skrow" style="width:80%"></div>
+          <div class="skrow" style="width:88%"></div><div class="skrow" style="width:64%"></div>
+        </div>
+      </div>`;
+    wrap.appendChild(grp);
+  });
+}
+function applyDocDone(it) {
+  const el = $(`doc-${it.dnr}-${it.doc}`);
+  if (!el) return;
+  el.classList.remove("sk"); el.classList.add("ready");
+  el.querySelector(".dmeta").textContent = "✓ klar";
+  (el.querySelector(".skgrid") || el.parentElement).querySelectorAll(".skcell,.skrow")
+    .forEach(x => x.remove());
+  el.insertAdjacentHTML("beforeend",
+    `<div style="font-size:13px;color:var(--muted)">${(it.sub||"").replace(/</g,"&lt;")}</div>`);
+}
+
+$("btn-bevis-go").onclick = async () => {
+  renderDocSkeletons((lastJob || {}).results);
+  $("analysis-title").textContent = "Skriver dokumenten …";
+  show("s-analysis");
+  try {
+    await api("/api/fortsatt", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({job_id: jobId})});
+    poll("fortsatt");
+  } catch (e) { fail(e.message); }
+};
+
+// ---- steg 4: resultat
+function visorResultat(j) {
+  feedItems(j);          // ge resultatskärmen en sista svärm
+  docs = j.docs;
+  const el = $("result-docs"); el.innerHTML = "";
+  (docs.ansokningar || []).forEach(a => {
+    const r = (j.results || []).find(x => x.dnr === a.dnr) || { stats: {} };
+    const grp = document.createElement("div");
+    grp.className = "docround";
+    grp.innerHTML = `<h3>${a.title} <span class="pill">${a.dnr}</span></h3>
+      <div class="row" style="margin-bottom:10px">
+        <span class="stat ok">✅ ${r.stats.styrkt_uppfyllt||0} styrkta</span>
+        <span class="stat warn">❓ ${r.stats.okant||0} luckor</span>
+        <span class="stat bad">❌ ${r.stats.styrkt_ej_uppfyllt||0} felmatch</span>
+        <span class="stat">🔧 ${r.stats.strukturellt||0} strukturkrav</span>
+      </div>
+      <div class="docs" style="margin-top:0">
+        <a class="docbtn ready" download="${a.filnamn_xlsx}"
+           href="/api/download/${jobId}/excel/${a.dnr}.xlsx">
+          <b>📊 Kravmatris (Excel)</b>
+          <span>${a.dnr} — bevisstatus per krav</span>
+        </a>
+        <button class="docbtn ready" data-dnr="${a.dnr}">
+          <b>📝 Ansökningshandling</b>
+          <span>klicka för att visa utkastet</span>
+        </button>
+      </div>`;
+    el.appendChild(grp);
+  });
+  el.querySelectorAll("button.docbtn").forEach(b => {
+    b.onclick = () => {
+      const a = docs.ansokningar.find(x => x.dnr === b.dataset.dnr);
+      $("docview").hidden = false;
+      $("docview").innerHTML = marked.parse(a.md);
+      $("download-row").hidden = false;
+      $("dl-md").href = `/api/download/${jobId}/ansokan/${a.dnr}.md`;
+      $("dl-md").setAttribute("download", a.filnamn_md);
+      $("docview").scrollIntoView({behavior:"smooth", block:"nearest"});
+    };
+  });
+  $("result-title").textContent =
+    `Dokument för ${j.company} — en kravmatris och en ansökningshandling per ansökan`;
+  show("s-result");
+}
+
+// ---- navigering
+$("btn-start").onclick = start;
+document.addEventListener("keydown", e => {
+  if (e.key === "Enter" && current === 0) start();
+  else if (e.key === "Enter" && current === 2) $("btn-summary").click();
+  else if (e.key === "Enter" && current === 3 && sel.size > 0) $("btn-pick").click();
+  else if (e.key === "Enter" && current === 4) $("btn-kravsum-go").click();
+  else if (e.key === "Enter" && current === 6) $("btn-bevis-go").click();
+  else if (e.key === "r" && current === 7) location.reload();
+  else if (e.key === "ArrowDown") $("nav-down").click();
+  else if (e.key === "ArrowUp") $("nav-up").click();
+});
+$("nav-up").onclick = () => { if (current > 0) show(screens[current-1]); };
+$("nav-down").onclick = () => { if (current < screens.length-1) show(screens[current+1]); };
+</script>
+</body>
+</html>

@@ -1,0 +1,821 @@
+"""Kärnlogik för demon — pipelinen som återanvändbara funktioner.
+
+Flöde: scrape_company -> match_rounds (bara framtida/öppna) -> fetch_requirements
+-> fact_find -> build_krav_doc + build_application_doc.
+"""
+import json
+import os
+import re
+import time
+import urllib.request
+
+from vilabbet_client import api_get, api_post, chat, cosine, embed
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FIRECRAWL = "https://api.berget.ai/v1/firecrawl"
+BERGET_KEY = os.environ.get("BERGET_API_KEY", "").strip()
+
+PRIO_PAT = re.compile(
+    r"($|/(om|about|om-oss|who-we-are|company|bolaget|produkter?|products?|"
+    r"tjanster|tjänster|services|erbjudande|offer|losningar|lösningar|solutions|"
+    r"case|kunder|customers|branscher|industries|teknik|tech|plattform|platform|"
+    r"ai|varfor|varför|why|karriar|career|jobb))", re.IGNORECASE)
+SKIP_PAT = re.compile(
+    r"(blogg|blog|nyhet|news|press|artikel|article|pod|event|webinar|"
+    r"integritet|privacy|cookie|gdpr|terms|villkor|legal|login|signup|"
+    r"kontakt|contact|tag/|category/|author/|\.(pdf|jpg|png|zip)$)",
+    re.IGNORECASE)
+
+MAX_PAGES = 8
+MAX_MD_PER_PAGE = 9000
+
+ORGNR_PAT = re.compile(r"\b(55\d{4}-\d{4})\b")
+
+KOSTTAK_PAT = re.compile(r"(maximalt bidrag|maximal ansökan|högst \d|stödnivå|"
+                         r"stodniva|får motsvara|procent av)", re.IGNORECASE)
+KRAVTYPER = {"eligibility", "formal", "time", "co_financing"}
+
+
+def _tell(cb, msg, item=None):
+    if cb:
+        cb(msg)
+        if item is not None:
+            cb(item)          # strukturerat "bevis" för skärmsläckaren
+    print(f"  [demo] {msg}")
+
+
+def _first_line(md):
+    for line in (md or "").splitlines():
+        line = line.strip().strip("#>*- ")
+        if len(line) > 25:
+            return line[:110]
+    return ""
+
+
+def _fc(endpoint, payload, timeout=120):
+    req = urllib.request.Request(
+        f"{FIRECRAWL}/{endpoint}", data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {BERGET_KEY}",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+# ---------------------------------------------------------------- scrape
+
+def scrape_company(url, name=None, progress=None):
+    base = url.rstrip("/")
+    m = re.match(r"^https?://(www\.)?([^/]+)", base)
+    dom = m.group(2)
+    name = name or dom.split(".")[0].capitalize()
+
+    _tell(progress, "Kartlägger webbplatsen …")
+    urls = [base]
+    try:
+        r = _fc("map", {"url": base, "limit": 400})
+        found = r.get("links") or (r.get("data") or {}).get("links") or []
+        urls += [u.get("url") if isinstance(u, dict) else u for u in found]
+    except Exception as e:  # noqa: BLE001
+        _tell(progress, f"Kartläggning misslyckades ({e}) — fortsätter med startsidan")
+
+    picked, seen = [], set()
+    for u in urls:
+        if not u or u in seen or SKIP_PAT.search(u):
+            continue
+        seen.add(u)
+        if u.rstrip("/") == base or PRIO_PAT.search(u.replace(base, "")):
+            picked.append(u)
+    picked = picked[:MAX_PAGES]
+    _tell(progress, f"Hittade {len(urls)} sidor — skrapar {len(picked)} av dem")
+
+    pages = []
+    for i, u in enumerate(picked, 1):
+        _tell(progress, f"Skrapar sida {i}/{len(picked)} …")
+        try:
+            r = _fc("scrape", {"url": u, "formats": ["markdown"],
+                               "onlyMainContent": True})
+            md = (r.get("data") or {}).get("markdown") or ""
+        except Exception as e:  # noqa: BLE001
+            md = ""
+            _tell(progress, f"  kunde inte skrapa {u}: {str(e)[:80]}")
+        if md:
+            pages.append({"url": u, "markdown": md[:MAX_MD_PER_PAGE]})
+            _tell(progress, f"  ✓ {u.split(dom)[-1] or u} ({len(md)} tecken)",
+                  {"kind": "page", "title": u.replace(base, "") or "/",
+                   "sub": _first_line(md), "n": len(md)})
+        time.sleep(0.2)
+    if not pages:
+        raise RuntimeError("Kunde inte skrapa någon sida från webbplatsen")
+
+    _tell(progress, "Sammanfattar bolagsprofil …")
+    material = "\n\n".join(f"### {p['url']}\n{p['markdown']}" for p in pages)
+    system = """Du skapar en företagsprofil som ska användas för att matcha bolaget
+mot svenska innovationsutlysningar (Vinnova m.fl.). Skriv på svenska i exakt
+denna struktur:
+
+<BOLAGSNAMN>
+
+<1-2 meningar: vad bolaget gör, grundat år om det framgår, storlek om det framgår>
+
+Produkter och teknik:
+- <punktlista>
+
+Differentiering och värdeerbjudande:
+- <punktlista>
+
+Kunder: <branscher och kundtyper>
+
+Kompetens: <nyckelkompetenser, kommaseparerat>
+
+Vi söker samarbeten kring: <3-6 teman härledda ur erbjudandet>
+
+Skriv endast sådant som stöds av källmaterialet. 200-350 ord."""
+    profil, _ = chat([{"role": "system", "content": system},
+                      {"role": "user", "content":
+                       f"Bolag: {name} ({base})\n\nSKRAPAT MATERIAL:\n{material}"}],
+                     model="default", max_tokens=1200, temperature=0.2)
+    return {"company": name, "base_url": base, "pages": pages,
+            "profil": profil.strip()}
+
+
+def bolagsfakta_from_sites(company_data, orgnr=None, progress=None):
+    """Försök hitta org.nr i materialet; skrapa allabolag för hårda fakta."""
+    pages = company_data["pages"]
+    kandidater = {}
+    if not orgnr:
+        namn_del = company_data["company"].lower().split()[0]
+        for p in pages:
+            for m in ORGNR_PAT.finditer(p["markdown"]):
+                kontext = p["markdown"][max(0, m.start() - 300):m.end() + 300].lower()
+                rad = p["markdown"][p["markdown"].rfind("\n", 0, m.start()):
+                                    p["markdown"].find("\n", m.end())].lower()
+                poang = 1 + (2 if namn_del in kontext else 0) + (3 if namn_del in rad else 0)
+                kandidater[m.group(1)] = max(kandidater.get(m.group(1), 0), poang)
+        if kandidater:
+            orgnr = max(kandidater.items(), key=lambda kv: kv[1])[0]
+            _tell(progress, f"Hittade org.nr i materialet: {orgnr}")
+    if not orgnr:
+        return None
+
+    # 1) verifiera/enrich:a mot Bolagsverkets officiella register (lokal kopia)
+    reg = None
+    try:
+        import foretagsregister
+        reg = foretagsregister.lookup(orgnr)
+        if reg:
+            _tell(progress,
+                  f"✓ {reg['namn']} — grundat {reg['grundat_ar']}, {reg['form']}, "
+                  f"{'i likvidation/rekonstruktion!' if reg['likvidation_eller_rekonstruktion'] else 'aktiv'} {reg['ort']}",
+                  {"kind": "bolagsreg",
+                   "title": f"⚖️ {reg['namn']}",
+                   "sub": f"grundat {reg['grundat_ar']} · {reg['form']} · {reg['ort']}"})
+        else:
+            # orgnr missar registret? kan vara felaktig orgnr på sajten
+            for kand in sorted(kandidater, key=lambda k: -kandidater[k]):
+                alt = foretagsregister.lookup(kand)
+                if alt:
+                    _tell(progress,
+                          f"Org.nr {orgnr} saknas i registret — byter till {kand} "
+                          f"({alt['namn']})")
+                    orgnr = kand
+                    reg = alt
+                    break
+            if not reg:
+                _tell(progress, "Org.nr saknas i Bolagsverkets register — litar på allabolag")
+    except Exception:  # noqa: BLE001
+        reg = None
+
+    _tell(progress, f"Hämtar bolagsfakta för {orgnr} …")
+    url = f"https://www.allabolag.se/{orgnr.replace('-', '')}"
+    try:
+        r = _fc("scrape", {"url": url, "formats": ["markdown"],
+                           "onlyMainContent": False})
+        md = (r.get("data") or {}).get("markdown") or ""
+        if "Å nej" in md:
+            md = ""
+    except Exception:  # noqa: BLE001
+        md = ""
+    if not md:
+        return None
+    pages.append({"url": url, "markdown": md})
+    user = f"""Extrahera bolagsfakta ur denna allabolag.se-text för org.nr {orgnr}.
+Svara ENBART med JSON: {{"namn": str|null, "anstallda": int|null,
+"grundat": int|null, "omsattning_tkr": int|null, "balans_tkr": int|null,
+"snittsiffror": bool}}
+
+TEXT:
+{md[:12000]}"""
+    content, _ = chat([{"role": "user", "content": user}],
+                      model="default", max_tokens=400, temperature=0.0)
+    try:
+        facts = json.loads(content[content.index("{"):content.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        facts = {}
+    party = {"name": facts.get("namn") or company_data["company"],
+             "legal_form": "limited_company", "registration_country": "SE",
+             "operations_in_sweden": True, "is_research_organisation": False}
+    if facts.get("anstallda") is not None:
+        party["employees"] = facts["anstallda"]
+    if facts.get("grundat") is not None:
+        party["founded"] = facts["grundat"]
+    if facts.get("omsattning_tkr") is not None and not facts.get("snittsiffror"):
+        party["turnover_ksek"] = facts["omsattning_tkr"]
+    if facts.get("balans_tkr") is not None and not facts.get("snittsiffror"):
+        party["balance_sheet_total_ksek"] = facts["balans_tkr"]
+    # officiellt register tar precedens på juridiska fält
+    if reg:
+        party["name"] = reg["namn"]
+        if reg.get("grundat_ar"):
+            party["founded"] = reg["grundat_ar"]
+    _tell(progress, f"Bolagsfakta: {party}")
+    return {"orgnr": orgnr,
+            "kalla": "Bolagsverket + allabolag" if reg else url,
+            "party": party, "registret": reg}
+
+
+# ---------------------------------------------------------------- matchning
+
+def _caches():
+    rounds = json.load(open(os.path.join(HERE, "cache", "rounds_list.json")))
+    details = json.load(open(os.path.join(HERE, "cache", "rounds_detail.json")))
+    emb = json.load(open(os.path.join(HERE, "cache", "embeddings.json")))
+    return rounds, details, emb
+
+
+def match_rounds(profil, max_results=15, progress=None, model="default"):
+    rounds, details, emb_cache = _caches()
+    _tell(progress, "Embeddar bolagsprofilen …")
+    pvec = embed([profil])[0]
+
+    _tell(progress, f"Matchar mot {len(rounds)} omgångar …")
+    sims = []
+    for r in rounds:
+        c = emb_cache.get(r["dnr"])
+        if not c:
+            continue
+        st = (details.get(r["dnr"]) or {}).get("status") or r.get("status") or {}
+        framtida = st.get("can_apply_now") or r.get("state") in ("open", "upcoming")
+        if not framtida:
+            continue
+        sims.append({
+            "dnr": r["dnr"], "title": r["title"],
+            "funder": r.get("funder"), "state": r.get("state"),
+            "closing_date": r.get("closing_date"),
+            "can_apply_now": bool(st.get("can_apply_now")),
+            "similarity": cosine(pvec, c["vec"]),
+            "warnings": st.get("warnings", []),
+        })
+    sims.sort(key=lambda x: -x["similarity"])
+    # embeddings är bara en grovsil — LLM:en ger den egaentliga bedömningen
+    kandidater = sims[:max(40, max_results * 3)]
+    _tell(progress, f"{len(sims)} framtida/öppna omgångar hittade — "
+                    f"bedömer {len(kandidater)} med AI …")
+
+    if kandidater:
+        block = "\n".join(
+            f"{v['dnr']}: {v['title']}\nVEM: {((details.get(v['dnr']) or {}).get('who') or {}).get('sv', '-')}"
+            f"\nVAD: {((details.get(v['dnr']) or {}).get('what') or {}).get('sv', '-')[:300]}"
+            for v in kandidater)
+        user = f"""BOLAGSPROFIL:
+{profil[:1800]}
+
+Bedöm VARJE ansökningsomgångs passform för bolaget med utgångspunkt i VEM och
+VAD — ärligt, gissa inte:
+- "passform": "bra" (tydligt överlapp i tema/teknik OCH målgrupp),
+  "mojlig" (möjlig med anpassad ansats), "dalig" (bolaget passar inte
+  syftet/målgruppen), "ej_bedombar" (för lite info).
+- "poang": heltal 0–100 (samlad bedömning av passform).
+- "varfor": max 15 ord, rakt besked.
+Svara ENBART med JSON-lista:
+[{{"dnr": "...", "passform": "...", "poang": 0, "varfor": "..."}}, ...]
+
+{block}"""
+        content, _ = chat([{"role": "user", "content": user}],
+                          model=model, max_tokens=3000, temperature=0.2)
+        try:
+            b = json.loads(content[content.index("["):content.rindex("]") + 1])
+            bed = {x.get("dnr"): x for x in b if isinstance(x, dict)}
+        except (ValueError, json.JSONDecodeError):
+            bed = {}
+        for v in kandidater:
+            x = bed.get(v["dnr"], {})
+            v["passform"] = x.get("passform", "")
+            v["matchpoang"] = x.get("poang")
+            v["varfor"] = x.get("varfor", "")
+
+    kandidater.sort(key=lambda x: -(x.get("matchpoang") or -1))
+    valda = [v for v in kandidater if v.get("matchpoang") is not None][:max_results]
+    for v in valda[:8]:
+        _tell(progress, f"  {v['matchpoang']} %: {v['title'][:60]}",
+              {"kind": "match", "title": v["title"][:70],
+               "sub": f"{v['matchpoang']} % · {v.get('passform') or ''} · "
+                      f"stänger {str(v.get('closing_date'))[:10]}"})
+    _tell(progress, f"visar topp {len(valda)} efter AI-bedömning")
+    return valda
+
+
+# ---------------------------------------------------------------- krav
+
+def fetch_requirements(dnr):
+    reqs = api_get(f"/v1/rounds/{dnr}/requirements").get("data", {})
+    if isinstance(reqs, dict):
+        reqs = reqs.get("requirements", reqs)
+    valda = [r for r in reqs
+             if r.get("type") in KRAVTYPER
+             or (r.get("type") == "cost" and KOSTTAK_PAT.search(r.get("text") or ""))]
+    return reqs, valda
+
+
+FAKTASYSTEM = """Du är en noggrann faktakontrollant. Du får krav från en svensk
+innovationsutlysning och skrapad text från ett företags webbplats.
+
+För VARJE krav: avgör om textmaterialet innehåller fakta som besvarar det.
+Svara ENBART utifrån materialet — gissa aldrig.
+
+Statusvärden:
+- "styrkt_uppfyllt": materialet visar att kravet är uppfyllt. Ange kort citat.
+- "styrkt_ej_uppfyllt": materialet visar att kravet INTE uppfylls. Ange citat.
+- "okant": materialet saknar relevant fakta.
+- "strukturellt": kravet gäller ansökans/projektets upplägg (konsortium,
+  projektplan, underskrifter, budget) — inget bolagsfaktum.
+
+Svara med ENBART en JSON-lista, ett objekt per krav, samma ordning:
+{"requirement_id": "...", "status": "...", "fakta": "citat eller fynd, annars null",
+ "kommentar": "max 1 mening eller null"}"""
+
+
+def _korta(text, n=200):
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def fact_find(profil, material, dnr, valda_krav, progress=None, model="default"):
+    svar = []
+    BATCH = 40
+    for i in range(0, len(valda_krav), BATCH):
+        batch = valda_krav[i:i + BATCH]
+        _tell(progress, f"  krav {i + 1}–{min(i + BATCH, len(valda_krav))} av {len(valda_krav)}")
+        kravlista = "\n".join(
+            f'{r["requirement_id"]} [{r.get("type")}]: {_korta(r.get("text"))}'
+            for r in batch)
+        user = f"""BOLAGSPROFIL:
+{profil[:2000]}
+
+SKRAPAT MATERIAL FRÅN BOLAGETS WEBBPLATS OCH BOLAGSREGISTER:
+{material[:24000]}
+
+KRAV ATT BESVARA ({len(batch)} st, omgång {dnr}):
+{kravlista}"""
+        content, usage = chat([{"role": "system", "content": FAKTASYSTEM},
+                               {"role": "user", "content": user}],
+                              model=model, max_tokens=6000, temperature=0.0)
+        try:
+            parsed = json.loads(content[content.index("["):
+                                        content.rindex("]") + 1])
+            svar.extend(parsed)
+            by_req = {r["requirement_id"]: r for r in batch}
+            for s in parsed:
+                req = by_req.get(s.get("requirement_id"), {})
+                _tell(progress, f"  [{s.get('status')}] {_korta(req.get('text'), 60)}",
+                      {"kind": "req", "status": s.get("status", "okant"),
+                       "id": s.get("requirement_id"), "dnr": dnr,
+                       "title": _korta(req.get("text"), 95),
+                       "sub": _korta(s.get("fakta") or s.get("kommentar")
+                                     or f"typ: {req.get('type')}", 90)})
+        except (ValueError, json.JSONDecodeError):
+            pass
+    by_id = {s.get("requirement_id"): s for s in svar}
+    ut = []
+    for r in valda_krav:
+        s = by_id.get(r["requirement_id"], {})
+        prov = r.get("provenance") or {}
+        ut.append({
+            "requirement_id": r["requirement_id"],
+            "type": r.get("type"), "mandatory": r.get("mandatory"),
+            "checkable": r.get("checkable"), "text": r.get("text"),
+            "status": s.get("status", "okant"),
+            "fakta": s.get("fakta"), "kommentar": s.get("kommentar"),
+            "prov_terms_id": prov.get("terms_id"),
+            "prov_anchor": prov.get("anchor") or (prov.get("trace") or {}).get("anchor"),
+            "prov_quote": _korta(prov.get("quote"), 260),
+        })
+    return ut
+
+
+def motor_check(dnr, party, progress=None):
+    """Kör officiella eligibility-checken om vi har bolagsfakta."""
+    if not party:
+        return None
+    parties = [party, {
+        "name": "Eventuell partner (behovsägare)",
+        "legal_form": "limited_company", "registration_country": "SE",
+        "operations_in_sweden": True, "employees": 400, "is_needs_owner": True}]
+    try:
+        d = api_post("/v1/eligibility/check",
+                     {"round_dnr": dnr, "parties": parties}).get("data", {})
+        return {k: d.get(k) for k in ("eligible", "automatic_count",
+                                      "not_met_count", "needs_review_count",
+                                      "explanation")}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def hämta_kravobj(dnr, progress=None):
+    """Hämta rundinfo + relevanta krav — ingen LLM, bara korpus-API:t."""
+    rounds = json.load(open(os.path.join(HERE, "cache", "rounds_list.json")))
+    meta = next((r for r in rounds if r["dnr"] == dnr), {})
+    d = api_get(f"/v1/rounds/{dnr}").get("data", {})
+    alla, valda = fetch_requirements(dnr)
+    title = d.get("title") or meta.get("title", dnr)
+    _tell(progress, f"  {dnr}: {len(valda)} av {len(alla)} krav relevanta",
+          {"kind": "kravlista",
+           "title": f"{len(valda)} relevanta krav identifierade",
+           "sub": _korta(title, 70)})
+    return {
+        "dnr": dnr, "title": title,
+        "closing_date": d.get("closing_date") or meta.get("closing_date"),
+        "state": d.get("state") or meta.get("state"),
+        "funder": d.get("funder") or meta.get("funder"),
+        "source_url": meta.get("source_url"),
+        "n_krav_totalt": len(alla),
+        "krav_objekt": [{"requirement_id": r.get("requirement_id"),
+                         "type": r.get("type"),
+                         "text": r.get("text")} for r in valda],
+    }
+
+
+def analysera(company_data, bolagsfakta, dnr, progress=None, model="default",
+              prefetched=None):
+    rounds = json.load(open(os.path.join(HERE, "cache", "rounds_list.json")))
+    meta = next((r for r in rounds if r["dnr"] == dnr), {})
+    d = api_get(f"/v1/rounds/{dnr}").get("data", {})
+    if prefetched:
+        valda, antal_totalt = prefetched["krav_objekt"], prefetched["n_krav_totalt"]
+    else:
+        alla, valda = fetch_requirements(dnr)
+        antal_totalt = len(alla)
+    _tell(progress, f"letar bevis för {len(valda)} krav (av {antal_totalt} i korpuset)")
+    material = "\n\n".join(f"[{p['url']}]\n{p['markdown']}" for p in company_data["pages"])
+    krav = fact_find(company_data["profil"], material, dnr, valda,
+                     progress=progress, model=model)
+    stats = {}
+    for k in krav:
+        stats[k["status"]] = stats.get(k["status"], 0) + 1
+    motor = None
+    if bolagsfakta:
+        _tell(progress, "Kör officiella regelmotorn …")
+        motor = motor_check(dnr, bolagsfakta.get("party"))
+        if motor:
+            _tell(progress,
+                  f"  motor: eligible={motor.get('eligible')}",
+                  {"kind": "motor",
+                   "title": f"Regelmotor: eligible={motor.get('eligible')}",
+                   "sub": _korta(motor.get("explanation"), 110)})
+    return {
+        "dnr": dnr,
+        "title": d.get("title") or meta.get("title", dnr),
+        "funder": d.get("funder"), "who": (d.get("who") or {}).get("sv"),
+        "closing_date": d.get("closing_date"),
+        "state": d.get("state"), "status": d.get("status"),
+        "source_url": meta.get("source_url")
+        or (f"https://www.vinnova.se/ao/{dnr}" if not dnr.startswith(("vr", "formas")) else ""),
+        "n_krav_totalt": antal_totalt, "krav": krav, "stats": stats,
+                                            "motor": motor,
+    }
+
+
+ÄMNESREGLER = [
+    ("Regler, etik & strategi",
+      ["etisk", "forskningsed", "gdpr", "lagar och regler", "statligt stöd",
+       "eu:s", "europeiska unionen"]),
+    ("Ordnad administration & register",
+      ["luf", "ordnad löpande redovisning", "löpande bokföring", "skatteverket",
+       "arbetsgivare", "likvidation", "rekonstruktion", "kronofogde",
+       "obestånd", "bokföring"]),
+    ("Bidrag & budget",
+      ["bidrag", "stöd", "budget", "kostnad", "avskrivning", "finansiär",
+       "medfinansiering", "belopp", " kronor"]),
+    ("Storlek & ekonomi",
+      ["anställd", "årsarbetskraft", "omsättning", "balans", "vinstutdelning",
+       "aktiekapital", "mkr", "nettoomsättning"]),
+    ("Bolag & ägarskap",
+      ["aktiebolag", "koncern", "börsnoterad", "fusion", "övertagande",
+       "juridisk", "aktieägare", "svensk", "sverige", "bolag"]),
+    ("Projekt & organisation",
+      ["projektavtal", "koordinator", "projektledare", "projekttid",
+       "godkännande", "projektparts", "arbetspaket", "projekt"]),
+]
+ÄMNESORDNING = [a for a, _ in ÄMNESREGLER] + ["Övrigt"]
+
+
+def ämnesgrupp(text):
+    t = " " + (text or "").lower()
+    for namn, nycklar in ÄMNESREGLER:
+        if any(k in t for k in nycklar):
+            return namn
+    return "Övrigt"
+
+
+def gruppera_krav(kravobj_list, tröskel=0.94, model="embedding"):
+    """Slå ihop snarlika krav över (och inom) omgångar med embeddings +
+    union–find-klustring. Returnerar ämnessorterade grupper."""
+    alla = []
+    for ko in kravobj_list:
+        for r in ko["krav_objekt"]:
+            alla.append({"dnr": ko["dnr"], **r})
+    if not alla:
+        return []
+    vecs = embed([(r.get("text") or "")[:300] for r in alla], model=model)
+    n = len(alla)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cosine(vecs[i], vecs[j]) >= tröskel:
+                parent[find(i)] = find(j)
+    by = {}
+    for i in range(n):
+        by.setdefault(find(i), []).append(i)
+    grupper = []
+    for idxs in by.values():
+        inst = [alla[i] for i in idxs]
+        rep = max(inst, key=lambda r: len(r.get("text") or ""))
+        grupper.append({
+            "text": rep.get("text"),
+            "amne": ämnesgrupp(rep.get("text")),
+            "dnrs": sorted({i["dnr"] for i in inst}),
+            "forekomster": [{"dnr": i["dnr"], "id": i["requirement_id"],
+                             "type": i.get("type"),
+                             "text": _korta(i.get("text"), 160)}
+                            for i in inst],
+        })
+    return sorted(grupper,
+                  key=lambda g: (ÄMNESORDNING.index(g["amne"]),
+                                 -len(g["forekomster"])))
+
+
+STATUS_TEXT = {"styrkt_uppfyllt": "Styrkt uppfyllt",
+               "styrkt_ej_uppfyllt": "Styrkt ej uppfyllt",
+               "okant": "Okänt — att komplettera",
+               "strukturellt": "Strukturkrav"}
+
+
+def build_kravmatris_xlsx(res, bolagsnamn=""):
+    """Kravmatris som .xlsx-bytes: alla krav + bevisstatus + källa."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Kravmatris"
+    rubrik = ["Krav", "Typ", "Obligatoriskt", "Status",
+              "Bevis / citat", "Kommentar", "Källa"]
+    ws.append(rubrik)
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="111816")
+    FARGER = {"styrkt_uppfyllt": "dcfce7", "okant": "fef9c3",
+              "styrkt_ej_uppfyllt": "fee2e2", "strukturellt": "f3f4f6"}
+    for k in res["krav"]:
+        källa = (f"{k['prov_terms_id']}#{k['prov_anchor']}"
+                 if k.get("prov_terms_id") else "")
+        ws.append([k.get("text"), k.get("type"),
+                   "ja" if k.get("mandatory") else "",
+                   STATUS_TEXT.get(k.get("status"), k.get("status")),
+                   k.get("fakta") or "", k.get("kommentar") or "", källa])
+        sc = ws.cell(row=ws.max_row, column=4)
+        f = FARGER.get(k.get("status"))
+        if f:
+            sc.fill = PatternFill("solid", fgColor=f.upper())
+    bredd = [60, 14, 12, 18, 45, 35, 22]
+    for i, b in enumerate(bredd, 1):
+        ws.column_dimensions[get_column_letter(i)].width = b
+    for row in ws.iter_rows(min_row=2):
+        for c in row:
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{ws.max_row}"
+
+    o = wb.create_sheet("Översikt")
+    o.append([f"Kravmatris — {res['title']} ({res['dnr']})"])
+    o["A1"].font = Font(bold=True, size=14)
+    räk = res.get("stats", {})
+    rader = [
+        ("Bolag", bolagsnamn), ("Omgång", res["dnr"]),
+        ("Stänger", str(res.get("closing_date"))[:10]),
+        ("Finansiär", res.get("funder")),
+        ("Analyserade krav", sum(räk.values())),
+        ("Styrkt uppfyllda", räk.get("styrkt_uppfyllt", 0)),
+        ("Luckor (okänt)", räk.get("okant", 0)),
+        ("Felmatchningar", räk.get("styrkt_ej_uppfyllt", 0)),
+        ("Strukturkrav", räk.get("strukturellt", 0)),
+    ]
+    mot = res.get("motor") or {}
+    if mot:
+        rader += [("Regelmotor eligible", str(mot.get("eligible"))),
+                  ("Motorbesked", mot.get("explanation"))]
+    for a, b in rader:
+        o.append([a, b])
+    o.column_dimensions["A"].width = 24
+    o.column_dimensions["B"].width = 90
+    o.append([])
+    o.append(["⚠️ Underlaget för kravbeskorten är bolagets egen webbplats plus "
+              "offentliga register. Alla svar ska mänskliggranskas."])
+    o["A" + str(o.max_row)].alignment = Alignment(wrap_text=True)
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+# ---------------------------------------------------------------- dokument
+
+STATUS_LABEL = {"styrkt_uppfyllt": "✅ Styrkt uppfyllt",
+                "styrkt_ej_uppfyllt": "❌ Styrkt ej uppfyllt",
+                "okant": "❓ Okänt — att komplettera",
+                "strukturellt": "🔧 Strukturkrav"}
+
+
+def build_krav_doc(company_data, results, progress=None, model="default"):
+    """Dokument 1: sammanställd kravbild + förslag på vårt svar per omgång."""
+    bolag = company_data["company"]
+    delar = [f"""# Kravsammanställning och förslag till svar — {bolag}
+
+*Genererad {time.strftime('%Y-%m-%d')} · Vilabbet korpus 0.7.0 · Underlag: {len(company_data['pages'])} skrapade sidor + bolagsregister*
+
+> Alla svar ska granskas av en människa. Korpusets regel gäller: en källa för
+> allt, "kan inte avgöras" istället för gissning.
+"""]
+    for res in results:
+        st = res["stats"]
+        delar.append(f"""---
+
+## {res['title']} ({res['dnr']})
+
+**Finansiär:** {res.get('funder') or '–'} · **Stänger:** {str(res.get('closing_date'))[:10]} ·
+**Källa:** {res.get('source_url') or f'https://www.vinnova.se/ao/{res["dnr"]}'}
+
+**Vem kan söka:** {res.get('who') or '–'}
+
+**Faktaläge:** ✅ {st.get('styrkt_uppfyllt', 0)} styrkta ·
+❓ {st.get('okant', 0)} okända · ❌ {st.get('styrkt_ej_uppfyllt', 0)} felmatch ·
+🔧 {st.get('strukturellt', 0)} strukturkrav (av {len(res['krav'])} analyserade)
+""")
+        _tell(progress, f"Formulerar svarsförslag för {res['dnr']} …")
+        kravblock = "\n".join(
+            f"- [{STATUS_LABEL.get(k['status'], k['status'])}] ({k['type']}) "
+            f"{_korta(k['text'], 180)}"
+            + (f" — FAKTA: {_korta(k['fakta'], 120)}" if k.get("fakta") else "")
+            for k in res["krav"][:45])
+        prompt = f"""Du skriver avdelningen "Vårt svar" i en kravsammanställning för
+{bolag}. Nedan kommer omgångens krav med fakta-status. Skriv i svenska:
+
+### Vårt svar — {res['title']}
+
+1. **Kort bedömning** (2-3 meningar): passar omgången bolaget utifrån kraven?
+2. **Det vi redan uppfyller** — punktlista med hänvisning till styrkt fakta
+3. **Det vi måste komplettera** — punktlista över okända krav, och exakt vilken
+   handling som krävs (t.ex. "ta fram registreringsbevis", "identifiera konsortiepartner")
+4. **Strukturella åtaganden** — vad ansökans upplägg måste uppfylla (konsortium,
+   underskrifter, budget), formulerat som åtgärder
+
+Skriv aldrig påhittade fakta. Tona in att detta är ett utkast för mänsklig granskning.
+
+BOLAGSPROFIL:
+{company_data['profil'][:1500]}
+
+KRAV MED STATUS:
+{kravblock}"""
+        svar, _ = chat([{"role": "user", "content": prompt}],
+                       model=model, max_tokens=2200, temperature=0.3)
+        delar.append(svar)
+        _tell(progress, f"  ✓ svarsförslag klara för {res['dnr']}",
+              {"kind": "doc", "title": f"Vårt svar — {_korta(res['title'], 55)}",
+               "sub": _first_line(svar)})
+
+        tabellrader = []
+        for k in res["krav"]:
+            icon = {"styrkt_uppfyllt": "✅", "styrkt_ej_uppfyllt": "❌",
+                    "okant": "❓", "strukturellt": "🔧"}.get(k["status"], "")
+            fakta = f"„{k['fakta']}“" if k.get("fakta") else "–"
+            tabellrader.append(
+                f"| {icon} | {k['type']} | {_korta(k['text'], 160)} | "
+                f"{_korta(fakta, 130)} |")
+        prov_krav = next((k for k in res["krav"] if k.get("prov_terms_id")), None)
+        prov_txt = ""
+        if prov_krav:
+            prov_txt = (f"\n\n*Proveniens-exempel:* `{prov_krav['requirement_id']}` ← "
+                        f"`{prov_krav['prov_terms_id']}`"
+                        + (f"#{prov_krav['prov_anchor']}" if prov_krav.get("prov_anchor") else ""))
+        if res.get("motor"):
+            m = res["motor"]
+            prov_txt += (f"\n\n*Regelmotor:* eligible={m.get('eligible')} "
+                         f"({m.get('automatic_count')} auto, {m.get('not_met_count')} ej uppfyllda, "
+                         f"{m.get('needs_review_count')} granskning) — "
+                         f"{_korta(m.get('explanation'), 200)}")
+        delar.append(f"""
+### Bilaga: full kravbild ({len(res['krav'])} krav)
+
+| | Typ | Krav | Fakta/citat |
+|---|---|---|---|
+{chr(10).join(tabellrader)}
+{prov_txt}
+""")
+    return "\n".join(delar)
+
+
+def build_application_doc(company_data, res, progress=None, model="default"):
+    """Dokument 2: fullständig ansökningshandling (utkast)."""
+    bolag = company_data["company"]
+    dnr = res["dnr"]
+    material = "\n\n".join(f"[{p['url']}]\n{p['markdown'][:6000]}" for p in company_data["pages"])
+
+    formfragor = []
+    try:
+        d = api_get(f"/v1/rounds/{dnr}/form").get("data", {})
+        formfragor = d.get("questions") or []
+    except Exception:  # noqa: BLE001
+        formfragor = []
+    _tell(progress, f"{len(formfragor)} formulärfrågor hittade" if formfragor
+          else "Inget formulär i korpuset — använder standardstruktur",
+          {"kind": "form", "title": "Formulärfrågor" if formfragor else "Standardstruktur",
+           "sub": f"{len(formfragor)} frågor att besvara" if formfragor
+           else "klassisk ansökningsstruktur"})
+    for q in formfragor[:6]:
+        _tell(progress, f"  fråga: {_korta(q.get('question') or q.get('text'), 60)}",
+              {"kind": "form",
+               "title": _korta(q.get("question") or q.get("text") or q.get("label"), 95),
+               "sub": "formulärfråga"})
+
+    if formfragor:
+        fragelista = "\n".join(
+            f'{i}. {q.get("question") or q.get("text") or q.get("label")}'
+            + (f" (typ: {q.get('answer_type')}, max {q.get('max_length')} tecken)"
+               if q.get("answer_type") else "")
+            for i, q in enumerate(formfragor, 1))
+        struktur = f"""Skriv dokumentet som utkast till ansökan med EXAKT dessa
+formulärfrågor som avsnitt (samma ordning, numrerade). Under varje fråga:
+**Förslag till svar:** <konkret utkasttext för {bolag} inom ev. teckengräns>
+**Stöd/källa:** <vilken del av underlaget svaret vilar på, eller "ATT KOMPLETTERA: …">
+
+FORMULÄRFRÅGOR:
+{fragelista}"""
+    else:
+        struktur = f"""Korpuset saknar formulärfrågor för denna omgång. Använd denna
+klassiska ansökningsstruktur, ett avsnitt per punkt, med samma märkning
+"Förslag till svar" + "Stöd/källa":
+1. Sammanfattning av projektet (300 ord)
+2. Bakgrund och behov (problemet som löses)
+3. Projektbeskrivning och innovativ höjd
+4. Mål och förväntade effekter
+5. Genomförande (aktiviteter, tidplan)
+6. Projektorganisation och kompetens
+7. Budget och finansieringsplan (totalt, sökt belopp, egen insats)
+8. Risker och riskhantering
+9. Hållbarhet och jämställdhet
+10. Uppfyllelse av särskilda krav för omgången"""
+
+    prompt = f"""Du skriver utkast till en komplett svensk ansökningshandling åt
+bolaget {bolag} för utlysningen nedan. Skriv på svenska, professionellt och
+konkret. Påståenden om bolaget ska vila på det bifogade underlaget; där
+underlaget saknas skriver du "ATT KOMPLETTERA: …" istället för att gissa.
+
+UTLYSNING: {res['title']} ({dnr}), {res.get('funder') or ''}
+Stänger: {str(res.get('closing_date'))[:10]}
+Vem kan söka: {res.get('who') or '–'}
+
+VIKTIGA KRAV (urval):
+{chr(10).join('- ' + _korta(k['text'], 150) for k in res['krav'][:20])}
+
+BOLAGETS PROFIL:
+{company_data['profil']}
+
+UNDERLAG FRÅN WEBBPLATS:
+{material[:14000]}
+
+{struktur}
+
+Avsluta med en checklista "Innan inlämning" (underskrifter, bilagor, datum)."""
+    _tell(progress, "Skriver ansökningshandling …")
+    doc, _ = chat([{"role": "user", "content": prompt}],
+                  model=model, max_tokens=6000, temperature=0.3)
+    _tell(progress, "  ✓ ansökningshandling klar",
+          {"kind": "doc", "title": "📝 Ansökningshandling", "sub": _first_line(doc)})
+    return f"""# Utkast till ansökningshandling — {res['title']}
+
+*Bolag: {bolag} · Omgång: {dnr} · Genererad {time.strftime('%Y-%m-%d')} ·
+Källa: {res.get('source_url') or f'https://www.vinnova.se/ao/{dnr}'}*
+
+> ⚠️ Utkast för mänsklig granskning. "ATT KOMPLETTERA" markerar luckor i underlaget.
+
+---
+
+{doc}
+"""
