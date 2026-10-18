@@ -105,6 +105,7 @@ export interface JobState {
   log: string[];
   items: Item[];
   done: boolean;
+  mail_skickat?: boolean;
   error: string | null;
   company?: string;
   orgnr?: string | null;
@@ -138,12 +139,27 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+export interface FrånMailSvar {
+  ok: boolean;
+  privat_domän?: boolean;
+  domän?: string;
+  namn_gissning?: string | null;
+  träffar?: BolagTraff[];
+  url?: string;
+}
+
 export const Api = {
-  start: (url: string, orgnr?: string | null) =>
+  start: (url: string, orgnr?: string | null, email?: string | null) =>
     api<{ job_id: string }>("/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, orgnr }),
+      body: JSON.stringify({ url, orgnr, email }),
+    }),
+  frånMail: (email: string) =>
+    api<FrånMailSvar>("/från_mail", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
     }),
   job: (jobId: string) => api<JobState>(`/job/${jobId}`),
   select: (jobId: string, dnrs: string[]) =>

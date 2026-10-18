@@ -293,11 +293,17 @@
 <!-- 1: URL -->
 <section class="screen active" id="s-url">
   <div class="eyebrow">Vinnova-matcharen · demo</div>
-  <h1>Hej! Vilken webbplats hör bolaget till?</h1>
+  <h1>Hej! Din arbetsmail räcker — resten kollar vi upp själva</h1>
   <p class="lead">Vi skrapar sidan i bakgrunden, bygger en profil och matchar mot
     korpusets alla ansökningsomgångar — bara de som ligger framåt i tiden.</p>
-  <input type="text" id="inp-url" placeholder="t.ex. dittbolag.se" autofocus
-         enterkeyhint="go">
+  <input type="email" id="inp-email" placeholder="du@dittbolag.se" autofocus
+         enterkeyhint="go"
+         style="border:0; border-bottom:2px solid var(--line); border-radius:0;
+                font-size:21px; padding:10px 6px; max-width:560px; background:transparent">
+  <div class="micro" id="email-hint" style="margin-top:10px; color:var(--muted); font-size:13px">
+    eller — <input type="text" id="inp-url" placeholder="t.ex. dittbolag.se"
+         enterkeyhint="go"
+         style="display:inline-block; width:auto; min-width:220px; border-bottom:2px solid var(--line)"></div>
   <div id="gissa-banner" style="display:none; margin-top:16px; max-width:min(560px,85vw);
     background:var(--accent-soft); border:1.5px solid var(--accent); border-radius:12px;
     padding:14px 18px; font-size:14.5px"></div>
@@ -634,9 +640,74 @@ document.addEventListener("click", e => {
     $("org-suggest").style.display = "none";
 });
 
+// ---- mejl först: domänen avslöjar bolaget
+const MAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+let mailTimer = null;
+$("inp-email").addEventListener("input", e => {
+  clearTimeout(mailTimer);
+  const m = e.target.value.trim().toLowerCase();
+  if (!MAIL_RE.test(m)) return;
+  mailTimer = setTimeout(async () => {
+    const sp = $("gissa-spinner"); sp.style.display = "block";
+    try {
+      const r = await api("/api/från_mail", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: m }) });
+      sp.style.display = "none";
+      if (!r.ok) {
+        const h = $("email-hint");
+        h.innerHTML = `<span style="color:var(--warm)">@${r.domän} är en privat
+          mejldomän —</span> vilken webbadress hör bolaget till?
+          <input type="text" id="inp-url" placeholder="t.ex. dittbolag.se"
+           enterkeyhint="go"
+           style="display:inline-block; width:auto; min-width:220px; border-bottom:2px solid var(--line)">`;
+        kopplaUrlFält();
+        $("inp-url").focus();
+        return;
+      }
+      if (r.domän) $("inp-url").value = r.domän;
+      if ((r.träffar || []).length) renderGissaBanner(r.träffar);
+      $("inp-email").onkeydown = ev => { if (ev.key === "Enter" && $("inp-url").value.trim()) start(); };
+    } catch (e2) { sp.style.display = "none"; }
+  }, 800);
+});
+
 // ---- domän → bolagsgissning → föreslå orgnr före submit
+function renderGissaBanner(träffar) {
+  if (!träffar.length) return;
+  const b = $("gissa-banner");
+  b.innerHTML = `Vi tror det är <b>${träffar[0].namn}</b>
+    <span style="color:var(--muted)">(${träffar[0].orgnr})</span>.
+    Är det här bolaget?
+    <span style="margin-left:12px"></span>
+    <button class="btn" style="padding:6px 16px; font-size:13px" id="gissa-ja">Ja, bekräfta</button>
+    <button class="btn ghost" style="padding:6px 12px; font-size:13px" id="gissa-nej">Nej</button>` +
+    (träffar.length > 1 ?
+      `<div style="font-size:12.5px; color:var(--muted); margin-top:6px">
+        andra träffar: ${träffar.slice(1).map(t =>
+          `<span class="gissa-alt" data-org="${t.orgnr}" data-namn="${t.namn}"
+            style="cursor:pointer; color:var(--accent); border-bottom:1px solid var(--accent)"
+           >${t.namn} (${t.orgnr})</span>`).join(", ")}</div>` : "");
+  b.style.display = "block";
+  const välj = (orgnr, namn) => {
+    $("inp-orgnr").value = orgnr;
+    const cf = $("org-confirm");
+    cf.textContent = `⚖️ ${namn} — bekräftat från Bolagsverkets register`;
+    cf.style.display = "block";
+    b.style.display = "none";
+  };
+  $("gissa-ja").onclick = () => välj(träffar[0].orgnr, träffar[0].namn);
+  $("gissa-nej").onclick = () => { b.style.display = "none"; };
+  b.querySelectorAll(".gissa-alt").forEach(el => {
+    el.onclick = () => välj(el.dataset.org, el.dataset.namn);
+  });
+}
+
 let gissaTimer = null;
-$("inp-url").addEventListener("input", e => {
+function kopplaUrlFält() {
+  const fält = $("inp-url");
+  if (!fält) return;
+  fält.addEventListener("input", e => {
   clearTimeout(gissaTimer);
   const u = e.target.value.trim();
   if (!u.includes(".") || u.length < 4) return;
@@ -647,54 +718,26 @@ $("inp-url").addEventListener("input", e => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: u }) });
       sp.style.display = "none";
-      const träffar = g["träffar"] || [];
-      if (!träffar.length) return;
-      const b = $("gissa-banner");
-      b.innerHTML = `Vi tror det är <b>${träffar[0].namn}</b>
-        <span style="color:var(--muted)">(${träffar[0].orgnr})</span>.
-        Är det här bolaget?
-        <span style="margin-left:12px"></span>
-        <button class="btn" style="padding:6px 16px; font-size:13px" id="gissa-ja">Ja, bekräfta</button>
-        <button class="btn ghost" style="padding:6px 12px; font-size:13px" id="gissa-nej">Nej</button>` +
-        (träffar.length > 1 ?
-          `<div style="font-size:12.5px; color:var(--muted); margin-top:6px">
-            andra träffar: ${träffar.slice(1).map(t =>
-              `<span class="gissa-alt" data-org="${t.orgnr}" data-namn="${t.namn}"
-                style="cursor:pointer; color:var(--accent); border-bottom:1px solid var(--accent)"
-               >${t.namn} (${t.orgnr})</span>`).join(", ")}</div>` : "");
-      b.style.display = "block";
-      $("gissa-ja").onclick = () => {
-        $("inp-orgnr").value = träffar[0].orgnr;
-        const cf = $("org-confirm");
-        cf.textContent = `⚖️ ${träffar[0].namn} — bekräftat från Bolagsverkets register`;
-        cf.style.display = "block";
-        b.style.display = "none";
-      };
-      $("gissa-nej").onclick = () => { b.style.display = "none"; };
-      b.querySelectorAll(".gissa-alt").forEach(el => {
-        el.onclick = () => {
-          $("inp-orgnr").value = el.dataset.org;
-          const cf = $("org-confirm");
-          cf.textContent = `⚖️ ${el.dataset.namn} — bekräftat från Bolagsverkets register`;
-          cf.style.display = "block";
-          b.style.display = "none";
-        };
-      });
+      renderGissaBanner(g["träffar"] || []);
     } catch (e2) { sp.style.display = "none"; }
   }, 900);
-});
+  });
+}
+kopplaUrlFält();
 
 // ---- steg 1: starta
 async function start() {
   const url = $("inp-url").value.trim();
-  if (!url) { $("inp-url").focus(); return; }
+  if (!url) { ($("inp-url") || $("inp-email")).focus(); return; }
   const orgnr = $("inp-orgnr").value.trim() || null;
+  const emailraw = $("inp-email").value.trim().toLowerCase();
+  const email = MAIL_RE.test(emailraw) ? emailraw : null;
   $("work-log").innerHTML = ""; $("work-title").textContent = "Skrapar din webbplats…";
   lastItem = 0;
   show("s-work");
   try {
     const r = await api("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({url, orgnr})});
+      body: JSON.stringify({url, orgnr, email})});
     jobId = r.job_id;
     poll("match");
   } catch (e) { fail(e.message); }

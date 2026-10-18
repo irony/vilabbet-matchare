@@ -39,6 +39,7 @@ JOBS = {}
 class StartIn(BaseModel):
     url: str
     orgnr: str | None = None
+    email: str | None = None
 
 
 class SelectIn(BaseModel):
@@ -73,6 +74,8 @@ def start(inp: StartIn):
     jid, job = new_job_state()
     JOBS[jid] = job
     job["phase"] = "skrapar"
+    if inp.email:
+        job["_email"] = inp.email.strip().lower()
     pj = PipelineJob(job)
     _run_in_thread(pj.börja, inp.url, inp.orgnr)
     return {"job_id": jid, "phase": "skrapar"}
@@ -107,8 +110,18 @@ def gissa_bolag(inp: GissaIn):
     letar i Bolagsverkt-registret, och returnerar upp till 3 träffar att
     bekräfta eller pröva själva.
     """
-    import foretagsregister
     url = inp.url if inp.url.startswith(("http://", "https://")) else "https://" + inp.url
+    domän = re.sub(r"https?://(www\.)?", "", url).split("/")[0]
+    return _gissa_från_domän(domän, url=url)
+
+
+def _gissa_från_domän(domän: str, url: str | None = None) -> dict:
+    """Skrapa 1 sida på domänen och leta bolag i registret.
+
+    Returnerar {"namn_gissning", "träffar", "url"}.
+    """
+    import foretagsregister
+    url = url or ("https://" + domän)
     md, meta = "", {}
     try:
         r = demo_core._fc("scrape", {"url": url, "formats": ["markdown"],
@@ -127,10 +140,8 @@ def gissa_bolag(inp: GissaIn):
     h1 = re.search(r"^#\s+(.+?)\s*$", md, re.M)
     if h1:
         kandidater.append(h1.group(1))
-    # domän-prefix som sista utväg
-    dom = re.sub(r"https?://(www\.)?", "", url).split("/")[0]
-    if dom:
-        kandidater.append(dom.split(".")[0])
+    if domän:
+        kandidater.append(domän.split(".")[0])
 
     def sok(namn: str):
         t = foretagsregister.search(namn, limit=3)
@@ -147,6 +158,41 @@ def gissa_bolag(inp: GissaIn):
                         "url": url}
     namn = _rensa_gissning(kandidater[0]) if kandidater else None
     return {"namn_gissning": namn, "träffar": [], "url": url}
+
+
+# domäner vars e-post inte berättar något om bolagets webbplats
+PRIVATA_EPOSTDOMÄNER = {
+    "gmail.com", "googlemail.com", "hotmail.com", "hotmail.se",
+    "outlook.com", "live.com", "live.se", "msn.com", "icloud.com",
+    "me.com", "mac.com", "yahoo.com", "yahoo.se", "proton.me",
+    "protonmail.com", "aol.com", "telia.com", "comhem.se",
+    "bredband.net", "bredband2.se", "tele2.se", "telenor.se",
+    "spray.se", "passagen.se", "swipnet.se",
+}
+
+
+class MailIn(BaseModel):
+    email: str
+
+
+@app.post("/api/från_mail")
+def från_mail(inp: MailIn):
+    """E-postadress → domän → bolagsgissning.
+
+    Startskärmed v-2: användaren svarar bara på sin arbetsmail. Domänen
+    berättar nästan alltid bolagets webbplats; privat domän (gmail etc.)
+    faller tillbaka på att fråga om webbadressen direkt.
+    """
+    mail = inp.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", mail):
+        raise HTTPException(400, "ogiltig e-postadress")
+    domän = mail.split("@")[-1]
+    if domän in PRIVATA_EPOSTDOMÄNER:
+        return {"ok": False, "privat_domän": True, "domän": domän}
+    svar = _gissa_från_domän(domän)
+    svar["ok"] = True
+    svar["domän"] = domän
+    return svar
 
 
 @app.get("/api/job/{jid}")
@@ -183,8 +229,91 @@ def fortsatt(inp: JobIn):
     job = _job_or_404(inp)
     if job["phase"] != "bevissum":
         raise HTTPException(409, f"jobbet är i fas '{job['phase']}'")
-    _run_in_thread(PipelineJob(job).fortsätt)
+    jid = inp.job_id
+
+    def _fortsätt_och_maila():
+        PipelineJob(job).fortsätt()
+        if job["phase"] == "klar" and job.get("_email"):
+            _maila_klar(jid, job)
+
+    _run_in_thread(_fortsätt_och_maila)
     return {"ok": True}
+
+
+# --- resultatmail: transport styrs av env ---
+#   MAIL_WEBHOOK_URL       → POST:ar payload till en webhook (t.ex. n8n) som mailar
+#   SMTP_HOST/PORT/USER/PASS/FROM → smtplib SSL direkt
+#   PUBLIC_BASE            → bas-URL för nedladdningslänkar (default localhost)
+#   ingen av dessa → logg-only ("skulle ha mailat …") så demot är tyst-säkert
+def _maila_klar(jid: str, job: dict):
+    """Mailar nedladdningslänkarna om användaren angett e-post.
+
+    Körs när förstatt-tråden landar i 'klar'. Avsedd för fallet att användaren
+    stängt fliken: jobbet rullar färdigt server-side, mailet landar ändå.
+    """
+    import json
+    import urllib.request
+    base = os.environ.get("PUBLIC_BASE", "http://localhost:8377").rstrip("/")
+    emails = [a for a in (job.get("docs") or {}).get("ansokningar", [])]
+    länkar = []
+    for a in emails:
+        länkar.append(f"Kravmatris {a['dnr']}: "
+                      f"{base}/api/download/{jid}/excel/{a['dnr']}.xlsx")
+        länkar.append(f"Ansökning {a['dnr']}: "
+                      f"{base}/api/download/{jid}/ansokan/{a['dnr']}.md")
+        länkar.append(f"Granskning {a['dnr']}: "
+                      f"{base}/api/download/{jid}/granskning/{a['dnr']}.xlsx")
+    payload = {
+        "till": job["_email"],
+        "ämne": f"Dina Vinnova-dokument för {job.get('company', '')} är klara",
+        "bröd": ("Hej!\n\nDin matchning är färdig. Ladda hem dokumenten "
+                 "(länkarna gäller så länge demot körs):\n\n"
+                 + "\n".join(f"- {l}" for l in länkar)
+                 + f"\n\nGranska ansökan på: {base}/app/?jobb={jid}\n"
+                   "Granskningsformuläret på resultatsidan återifyller "
+                   "matrisen när ni gått igenom den internt.\n\n"
+                   "Vänliga hälsningar,\nVinnova-matcharen"),
+        "job_id": jid,
+        "länkar": länkar,
+    }
+    hook = os.environ.get("MAIL_WEBHOOK_URL")
+    try:
+        if hook:
+            req = urllib.request.Request(
+                hook, data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                job["log"].append(f"📧 Resultatmail skickat via webhook → "
+                                  f"{job['_email']} ({resp.status})")
+        elif os.environ.get("SMTP_HOST"):
+            import smtplib
+            from email.message import EmailMessage
+            m = EmailMessage()
+            m["From"] = os.environ.get("MAIL_FROM", "noreply@localhost")
+            m["To"] = payload["till"]
+            m["Subject"] = payload["ämne"]
+            m.set_content(payload["bröd"])
+            with smtplib.SMTP_SSL(
+                os.environ["SMTP_HOST"],
+                int(os.environ.get("SMTP_PORT", "465")),
+                timeout=20,
+            ) as s:
+                if os.environ.get("SMTP_USER"):
+                    s.login(os.environ["SMTP_USER"],
+                            os.environ.get("SMTP_PASS", ""))
+                s.send_message(m)
+            job["log"].append(f"📧 Resultatmail skickat → {job['_email']}")
+        else:
+            job["log"].append(
+                f"📧 (mail utan konfiguration — skulle ha mailat "
+                f"{job['_email']} med {len(länkar)} nedladdningslänkar)")
+        job["_mail_skickat"] = True
+        job["mail_skickat"] = True   # publik status för flödesvyn
+        job["items"].append({"kind": "mail",
+                             "title": f"📧 Resultatmail → {job['_email']}",
+                             "sub": f"{len(länkar)} nedladdningslänkar"})
+    except Exception as e:  # noqa: BLE001
+        job["log"].append(f"⚠️ Resultatmail misslyckades: {e}")
 
 
 @app.post("/api/feedback")

@@ -52,8 +52,9 @@ Två webbgränssnitt:
 ## Flöde
 
 ```
-url/orgnr
-  → skrapar   (firecrawl: startsida + några undersidor)
+arbetsmail (eller webbadress)
+  → från_mail (domän → skrapa förstasidan → registerträff → bekräfta org.nr)
+  → skrapar   (firecrawl: startsida + undersidor)
   → matchar   (embedding-relevans mot 303 öppna utlysningar → LLM-poängradi)
   → valet     (användaren bocknar i utlysningar)
   → hämtar krav / kravsum (skrapar + grupperar omgångens krav)
@@ -62,11 +63,40 @@ url/orgnr
   → dokumenterar (kravmatris-xlsx + ansökningsutkast-md per utlysning)
   → granskar    (bolagblind LLM: blockerare först) → granskning-xlsx (ifyllbart)
   → klar        (nedladdningar + feedbackformulär som fyller i xlsx)
+  → e-post      (resultatmailet med länkar går ut även om fliken stängts)
 ```
 
-Bonus: när användaren knappar in domänen i startskärmen gör servern
-`POST /api/gissa_bolag` → skrapar förstasidan → gissar bolagsnamn → slår i
-registret → föreslår orgnr (med Ja/Nej/alternativ) **innan** flödet startar.
+### Mejlförsta-start
+
+Startskärmen ber om arbetsmail (`POST /api/från_mail`): domänen berättar
+bolagets webbplats; servern skrapar förstasidan, gissar bolagsnamn och slår i
+registret — visar "Vi tror det är **X AB** (org.nr). Är det här bolaget?" med
+Ja/alternativ/Nej. Privata domäner (gmail m.fl.) faller tillbaka på att fråga
+om webbadress. Mejlen sparas privat i jobbet och används för resultatmailet.
+
+### Resultatmail
+
+När jobbet landar i `klar` och mejl angivits går ut ett mail med
+nedladdningslänkar + länk tillbaka till resultatsidan (`{base}/app/?jobb=<id>` —
+React-appen återupptar jobbet i rätt fas). Transport via env:
+
+| Env | Betydelse |
+|-----|-----------|
+| `MAIL_WEBHOOK_URL` | POST:ar payload `{till, ämne, bröd, länkar, job_id}` till en webhook (t.ex. n8n) som skickar mailet |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` | smtplib SSL direkt |
+| `PUBLIC_BASE` | bas-URL för länkar i mailet (default `http://localhost:8377`) |
+| ingen | logg-only: "skulle ha mailat …" (tyst-säkert för lokala demos) |
+
+### Flödesvy (ReactFlow)
+
+Arbets-/analysskärmarna är en interaktiv processkarta (`@xyflow/react`):
+domän → crawling (en nod per skrapad sida) → summering → hitta anslag →
+filtrera & prioritera → krav per omgång (klusternoder) → beslutsprocesser
+(en beslutsknut per krav, färg per verdict + källrad) → bevissum → artefakter
+(kravmatris/ansökan/granskning) → e-post. Datan byggs av den strukturerade
+`items`-ström som `demo_core` redan producerar — ingen pacing/trickeri bara
+live-telemetri. Växla tillbaka till klassisk text-logg: knappen nere till
+vänster.
 
 ## Restraint-att-tänka-på
 

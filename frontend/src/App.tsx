@@ -7,6 +7,7 @@ import SummaryScreen from "@/screens/SummaryScreen";
 import PickScreen from "@/screens/PickScreen";
 import KravSumScreen from "@/screens/KravSumScreen";
 import AnalysisScreen from "@/screens/AnalysisScreen";
+import FlowScreen from "@/screens/FlowScreen";
 import BevisSumScreen from "@/screens/BevisSumScreen";
 import ResultScreen from "@/screens/ResultScreen";
 import FeedbackScreen from "@/screens/FeedbackScreen";
@@ -25,10 +26,17 @@ const PROG: Record<Stage, number> = {
 export default function App() {
   const [stage, setStage] = useState<Stage>("start");
   const [workTitle, setWorkTitle] = useState("Letar …");
+  const [visVy, setVisVy] = useState<"flöde" | "logg">("flöde"); // processen visuellt som standard
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const jobRef = useRef<string | null>(null);
 
   const [jobId, setJobId] = useState<string | null>(null);
+  // återuppta jobb från ?jobb= (t.ex. länk ur resultatmail när fliken stängts)
+  const [resumed, setResumed] = useState(false);
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search).get("jobb");
+    if (p && /^[a-f0-9]{8,}$/i.test(p)) { setJobId(p); setResumed(true); }
+  }, []);
 
   const { data: job } = useQuery<JobState>({
     queryKey: ["job", jobId],
@@ -47,6 +55,18 @@ export default function App() {
     const p = job.phase;
     if (p === "fel") { setStage("error"); return; }
     setStage((s) => {
+      // återupptaget jobb: mappa serverfas direkt till skärm vid första svar
+      if (resumed && s === "start") {
+        setResumed(false);
+        if (p === "valet") return "summary";
+        if (p === "kravsum") return "kravsum";
+        if (p === "analyserar") { setWorkTitle("Letar bevis i er textmassa…"); return "analysis"; }
+        if (p === "bevissum") return "bevissum";
+        if (p === "dokumenterar") { setWorkTitle("Skriver dokumenten…"); return "analysis"; }
+        if (p === "granskar") { setWorkTitle("Granskar med färska ögon…"); return "analysis"; }
+        if (p === "klar") return "result";
+        return "working";
+      }
       if (s === "working") {
         if (p === "valet") return "summary";
         if (p === "kravsum") return "kravsum";
@@ -67,11 +87,11 @@ export default function App() {
   }, [job]);
 
   // handlers
-  const start = async (url: string, orgnr: string | null) => {
+  const start = async (url: string, orgnr: string | null, email: string | null) => {
     setStage("working"); setWorkTitle("Skrapar din webbplats…");
     jobRef.current = null; setSelection(new Set());
     try {
-      const r = await Api.start(url, orgnr);
+      const r = await Api.start(url, orgnr, email);
       jobRef.current = r.job_id; setJobId(r.job_id);
     } catch (e) { setStage("error"); throw e; }
   };
@@ -105,11 +125,24 @@ export default function App() {
         />
       </div>
       {stage === "start" && <StartScreen onStart={start} />}
-      {stage === "working" && <WorkingScreen title={workTitle} log={job?.log ?? []} items={job?.items ?? []} />}
+      {(stage === "working" || stage === "analysis") && job && visVy === "flöde" && (
+        <FlowScreen title={workTitle} job={job} />
+      )}
+      {(stage === "working" || stage === "analysis") && (!job || visVy === "logg") && stage === "working" && (
+        <WorkingScreen title={workTitle} log={job?.log ?? []} items={job?.items ?? []} />
+      )}
+      {(stage === "working" || stage === "analysis") && (!job || visVy === "logg") && stage === "analysis" && (
+        <AnalysisScreen title={workTitle} job={job ?? null} />
+      )}
+      {(stage === "working" || stage === "analysis") && (
+        <button
+          onClick={() => setVisVy(v => v === "flöde" ? "logg" : "flöde")}
+          className="fixed bottom-4 left-4 z-50 rounded-full border border-[color:var(--color-line)] bg-white/90 px-3.5 py-1.5 text-[12.5px] shadow-sm backdrop-blur hover:bg-white"
+        >{visVy === "flöde" ? "≣ visa klassisk logg" : "✨ visa processen visuellt"}</button>
+      )}
       {stage === "summary" && job && <SummaryScreen job={job} onNext={confirmSummary} onRestart={restart} />}
       {stage === "pick" && job && <PickScreen job={job} selection={selection} setSelection={setSelection} onNext={confirmSelection} />}
       {stage === "kravsum" && job && <KravSumScreen job={job} onNext={goAnalysis} onBack={() => setStage("pick")} count={selection.size} />}
-      {stage === "analysis" && <AnalysisScreen title={workTitle} job={job ?? null} />}
       {stage === "bevissum" && job && <BevisSumScreen job={job} onNext={goDocs} onBack={() => setStage("pick")} />}
       {stage === "result" && job && <ResultScreen job={job} jobId={jobId!} onFeedback={() => setStage("feedback")} onRestart={restart} />}
       {stage === "feedback" && job && <FeedbackScreen job={job} jobId={jobId!} onBack={() => setStage("result")} />}
