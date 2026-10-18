@@ -35,6 +35,42 @@ app = FastAPI(title="Utlysningsmatchning — demo")
 
 JOBS = {}
 
+# --- enkel persistence: JOBS → cache/jobstate.pkl var 8:e sekund,
+#     laddas vid uppstart så uvicorn-restarts/reload inte tappar jobben
+_STATE_FIL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "cache", "jobstate.pkl")
+
+
+def _ladda_state():
+    if not os.path.exists(_STATE_FIL):
+        return
+    try:
+        import pickle
+        with open(_STATE_FIL, "rb") as f:
+            sparat = pickle.load(f)
+        if isinstance(sparat, dict):
+            JOBS.update(sparat)
+            print(f"💾 laddade {len(sparat)} jobb från {_STATE_FIL}")
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ kunde ej läsa {_STATE_FIL}: {e}")
+
+
+def _spara_loop():
+    import pickle
+    import time as _t
+    while True:
+        _t.sleep(8)
+        try:
+            os.makedirs(os.path.dirname(_STATE_FIL), exist_ok=True)
+            with open(_STATE_FIL, "wb") as f:
+                pickle.dump(dict(JOBS), f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:  # noqa: BLE001
+            pass  # dict muterade under dump — försök igen nästa tick
+
+
+_ladda_state()
+threading.Thread(target=_spara_loop, daemon=True).start()
+
 
 class StartIn(BaseModel):
     url: str
@@ -286,6 +322,22 @@ def analysera(inp: JobIn):
         raise HTTPException(409, f"jobbet är i fas '{job['phase']}'")
     _run_in_thread(PipelineJob(job).analysera)
     return {"ok": True}
+
+
+class ChatIn(BaseModel):
+    job_id: str
+    meddelande: str
+
+
+@app.post("/api/chat")
+def chatt(inp: ChatIn):
+    job = JOBS.get(inp.job_id)
+    if not job:
+        raise HTTPException(404, "okänt jobb")
+    if not (inp.meddelande or "").strip():
+        raise HTTPException(400, "tomt meddelande")
+    import agent_core
+    return agent_core.agent_svara(job, inp.meddelande.strip())
 
 
 @app.post("/api/fortsatt")

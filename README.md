@@ -87,6 +87,34 @@ bifogas på varje granskningspunkt (`stöd`-fält), syns som gröna kort i
 granskningsvyn och hamnar i kolumnen "💡 Gap-stöd från hemsidan" i
 gransknings-Excel för "Skellefteå-användningsfall"-nivåsättning.
 
+### Agent-chatt i split-vy ("Lovable-läge")
+
+På resultatskärmen finns knappen "💬 Redigera med agent — Eurooffice +
+chatt": en 3+2-kolumnsvy med Eurooffice-redigeraren (iframe mot `/r/…`)
+till vänster och en agent-chatt till höger. Agenten är en gemma-4-loop
+(`agent_core.py`, mot Bergets gateway) med åtta verktyg:
+
+| verktyg | gör |
+|---|---|
+| `webbsök` | svenska webben (search.dmz.berget.ai, ~75k index) |
+| `skrapa` | hämta en webbsida som markdown (Firecrawl) |
+| `bolagssök` | Bolagsverkets register (namn → orgnr m.m.) |
+| `visa_dok_punktlista` / `läs_dok` | jobbets tre dokument (md / kravtabell / gap-tabell) |
+| `redigera_ansökan` | exakt text-ersättning i utkastet (md) |
+| `skriv_kravstatus` | status + bevis per krav → kravmatrisen byggs om |
+| `markera_granskpunkt` | status/ansvarig/kommentar per gap-punkt → arket byggs om |
+
+Skrivåtgärder bygger omedelbart om xlsx-byten i job-state **och**
+ogiltigförklarar Eurooffice-spårningen (`job._eo_files`) — iframen
+uppdateras då automatiskt och nästa upload drar den nya versionen. Gap-
+stöden (från förra sektionen) injiceras i system-prompten så agenten börjar
+i bolagets egna case-sidor och måste verifiera varje företag i registret
+innan de föreslår dem. System-prompten förbjuder hittad-fakta utan källa.
+
+Chatten lagras i job-state (`job.chat`) och syns även i publik vy. Backend:
+`POST /api/chat {job_id, meddelande}` – synkron, returnerar svar + körda
+verktygsanrop + ändrade dokument.
+
 ### Redigera i Eurooffice
 
 Knappen "✒ Öppna i Eurooffice ↗" på resultatskärmens dokument-kort går via

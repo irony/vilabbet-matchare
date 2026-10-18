@@ -106,6 +106,30 @@ export interface Item {
   doc?: string;
 }
 
+export interface ChatMsg {
+  roll: "användare" | "assistent";
+  innehåll: string;
+  verktyg?: { verktyg: string; args: Record<string, unknown> }[];
+  ändrade?: { kind: string; dnr: string; info: string }[];
+}
+
+export interface ChatSvar {
+  svar: string;
+  verktyg: { verktyg: string; args: Record<string, unknown> }[];
+  ändrade: { kind: string; dnr: string; info: string }[];
+}
+
+export function chatApi(jobId: string, meddelande: string): Promise<ChatSvar> {
+  return fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_id: jobId, meddelande }),
+  }).then(async (r) => {
+    if (!r.ok) throw new Error(String(r.status));
+    return r.json() as Promise<ChatSvar>;
+  });
+}
+
 export interface JobState {
   phase: Fas;
   step?: string;
@@ -125,6 +149,7 @@ export interface JobState {
   docs?: { ansokningar: DokAnsokan[] };
   granskning?: Record<string, Granskning>;
   feedback?: Record<string, unknown>;
+  chat?: ChatMsg[];
 }
 
 export interface BolagTraff {
