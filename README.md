@@ -74,27 +74,27 @@ registret — visar "Vi tror det är **X AB** (org.nr). Är det här bolaget?" m
 Ja/alternativ/Nej. Privata domäner (gmail m.fl.) faller tillbaka på att fråga
 om webbadress. Mejlen sparas privat i jobbet och används för resultatmailet.
 
-### Redigera i Eurooffice (OnlyOffice-flöde)
+### Redigera i Eurooffice
 
-Resultatskärmens dokument-kort har klicka "✒ Öppna i Eurooffice ↗" — servern
-renderar en OnlyOffice integrationsida (`/r/{jobb}/{excel|ansokan|granskning}/{dnr}`)
-som låter `eurooffice.berget.ai` (samma API som ONLYOFFICE Docs) dra filen
-från `/r-file/…` och spara tillbaka via `/r-save/…` (callbackUrl). Ansökan
-(.md) konverteras till .docx on-the-fly (`python-docx` — lägg med i run-raden).
-Redigeringar landar i job-state och därmed i nedladdningslänkarna direkt.
+Knappen "✒ Öppna i Eurooffice ↗" på resultatskärmens dokument-kort går via
+`GET /r/{jobb}/{excel|ansokan|granskning}/{dnr}`: servern laddar upp
+dokumentets bytes till eurooffices **example-app** (`POST
+{EUROOFFICE_HOST}/example/upload`, fält `uploadedFile`) och redirectar
+till editorn `…/example/editor?fileName=…&lang=sv-SE`. Ansökan (.md)
+konverteras till .docx on-the-fly (`python-docx` — lägg med i run-raden).
 
-Nyttiga env-variabler:
+Redigeringar sparas i example-appens egen lagring; servern spår den
+uppladdade filens `fileName` i jobbet (`_eo_files`) och hämtar senaste
+versionen via `GET …/example/download?fileName=…` varje gång någon klickar
+"Ladda ner" — så nedladdningslänkarna speglar redigeringarna direkt.
+Ingen åtkomst åt andra hållet krävs (demon kan ligga på localhost), ingen
+JWT, ingen callback-array.
 
-- `PUBLIC_BASE` — måste nås från eurooffice-servern (i produktion: publikt
-  dns-namn; vid lokala live-demos: en tunnel-URL, t.ex. cloudflared quick
-  tunnel). Default `http://localhost:8377` (redigeraren ramlar vidare men
-  dokumentservern kan ej dra filen).
+Env:
+
 - `EUROOFFICE_HOST` — default `https://eurooffice.berget.ai`
-- `EUROOFFICE_JWT_SECRET` — om OnlyOffice-instansen kräver JWT på configens
-  kontraktsområde, sätt den samma hemligheten här (HS256 signeras automatiskt)
 
-Körservern: `--with python-docx` till i uv-kommandot (för ansökan),
-`--host 0.0.0.0` om den ska nås utifrån.
+Körservern med `--with python-docx` + `--with httpx` för ansökan-resp. example-anropen.
 
 ### Resultatmail
 

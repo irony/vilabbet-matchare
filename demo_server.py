@@ -105,11 +105,11 @@ def _rensa_gissning(s: str) -> str:
 # Redigering direkt mot eurooffice.berget.ai — samma integrationsflöde som
 # ONLYOFFICE Docs: dokumentservern drar filen från /r-file-URL:en och sparar
 # tillbaka via /r-save (callbackUrl). PUBLIC_BASE måste vara nåbar från
-# eurooffice-servern i skarpt läge (inte localhost).
-#
-#   GET  /r/{jid}/{kind}/{dnr}      → editor-sidan (DocsAPI-config)
-#   GET  /r-file/{jid}/{kind}/{dnr} → råfil (xlsx / docx)
-#   POST /r-save/{jid}/{kind}/{dnr} → OnlyOffice-sparcallback (status 2/6)
+# eurooffice-flödet kräver ingen åtkomst åt andra hållet:
+#   GET  /r/{jid}/{kind}/{dnr} → laddar upp dokumentet till
+#        eurooffices example-app (server-side) och redirectar till editorn
+#   nedladdning: /api/download/… hämtar senast sparade versionen via
+#        /example/download om dokumentet spårats upp dit
 
 def _public_base() -> str:
     return os.environ.get("PUBLIC_BASE", "http://localhost:8377").rstrip("/")
@@ -324,7 +324,7 @@ def _maila_klar(jid: str, job: dict):
         länkar.append(f"Kravmatris {a['dnr']}: "
                       f"{base}/api/download/{jid}/excel/{a['dnr']}.xlsx")
         länkar.append(f"Ansökning {a['dnr']}: "
-                      f"{base}/api/download/{jid}/ansokan/{a['dnr']}.md")
+                      f"{base}/api/download/{jid}/ansokan/{a['dnr']}.docx")
         länkar.append(f"Granskning {a['dnr']}: "
                       f"{base}/api/download/{jid}/granskning/{a['dnr']}.xlsx")
     payload = {
@@ -398,7 +398,9 @@ def feedback(inp: FeedbackIn):
 @app.get("/api/download/{jid}/excel/{dnr}.xlsx")
 def dl_excel(jid: str, dnr: str):
     job = JOBS.get(jid)
-    data = (job or {}).get("_excel", {}).get(dnr)
+    if not job:
+        raise HTTPException(404)
+    data = _eo_hämta(job, "excel", dnr) or (job.get("_excel") or {}).get(dnr)
     if not data:
         raise HTTPException(404)
     return Response(
@@ -409,8 +411,23 @@ def dl_excel(jid: str, dnr: str):
                  f'attachment; filename="kravmatris_{job["company"]}_{dnr}.xlsx"'})
 
 
-@app.get("/api/download/{jid}/ansokan/{dnr}.md", response_class=PlainTextResponse)
+@app.get("/api/download/{jid}/ansokan/{dnr}.docx")
 def dl_ansokan(jid: str, dnr: str):
+    """Redigerbart utkast som .docx — senaste eurooffice-versionen om
+    dokumentet spårats dit (annars färsk md→docx-konvertering)."""
+    job = JOBS.get(jid)
+    if not job or not job.get("docs"):
+        raise HTTPException(404)
+    if not any(a["dnr"] == dnr for a in job["docs"]["ansokningar"]):
+        raise HTTPException(404)
+    data = _eo_hämta(job, "ansokan", dnr) or _doc_bytes(job, "ansokan", dnr)[0]
+    return Response(content=data, media_type=_DOCX_MIM,
+                    headers={"Content-Disposition":
+                             f'attachment; filename="ansokan_{job["company"]}_{dnr}.docx"'})
+
+
+@app.get("/api/download/{jid}/ansokan/{dnr}.md", response_class=PlainTextResponse)
+def dl_ansokan_md(jid: str, dnr: str):
     job = JOBS.get(jid)
     if not job or not job.get("docs"):
         raise HTTPException(404)
@@ -429,10 +446,13 @@ def dl_granskning(jid: str, dnr: str):
                 if r["dnr"] == dnr), None) if job else None
     if not g or not res:
         raise HTTPException(404)
+    from_eo = _eo_hämta(job, "granskning", dnr)
     fyllning = ((job.get("feedback") or {}).get(dnr)) if job else None
     if fyllning:
         data = demo_core.bygg_gransknings_xlsx(res, g, job["company"],
                                                fyllning=fyllning)
+    elif from_eo:
+        data = from_eo
     else:
         data = job["_granskning_xlsx"].get(dnr)
     if not data:
@@ -453,6 +473,53 @@ if os.path.isdir(_REACT_DIST):
 
 _EUROOFFICE_HOST = os.environ.get("EUROOFFICE_HOST",
                                   "https://eurooffice.berget.ai").rstrip("/")
+_EO_EXAMPLE = f"{_EUROOFFICE_HOST}/example"
+
+
+def _eo_ladda_upp(job: dict, kind: str, dnr: str) -> str | None:
+    """Laddar upp dokumentet till eurooffices example-app; lagrar fileName i
+    jobbet så vi kan slå ihop redigeringar senare. Returnerar editor-toolsets fileId."""
+    spår = job.setdefault("_eo_files", {})
+    nyckel = f"{kind}:{dnr}"
+    if nyckel in spår:
+        return spår[nyckel]["filename"]
+    data, _ft, _mim, namn = _doc_bytes(job, kind, dnr)
+    if not data:
+        return None
+    import httpx
+    r = httpx.post(f"{_EO_EXAMPLE}/upload",
+                   files={"uploadedFile": (namn, data)}, timeout=60)
+    r.raise_for_status()
+    filnamn = r.json().get("filename") or namn
+    spår[nyckel] = {"filename": filnamn, "uppladdad_namn": namn}
+    job["log"].append(f"☁️ {namn} laddades upp till Eurooffice ({filnamn})")
+    return filnamn
+
+
+def _eo_hämta(job: dict, kind: str, dnr: str) -> bytes | None:
+    """Hämtar senast redigerade versionen från eurooffices example-app om
+    dokumentet spårats där — uppdaterar job-statet återgivningsbart."""
+    spår = (job.get("_eo_files") or {}).get(f"{kind}:{dnr}")
+    if not spår:
+        return None
+    import httpx
+    try:
+        r = httpx.get(f"{_EO_EXAMPLE}/download",
+                      params={"fileName": spår["filename"]}, timeout=60)
+        r.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        job["log"].append(f"⚠️ kunde ej hämta från Eurooffice: {e}")
+        return None
+    data = r.content
+    if kind == "excel":
+        job.setdefault("_excel", {})[dnr] = data
+    elif kind == "granskning":
+        job.setdefault("_granskning_xlsx", {})[dnr] = data
+    else:
+        job.setdefault("_ansokan_docx", {})[dnr] = data
+    job["log"].append(f"⬅️ {spår['filename']} hämtad från Eurooffice "
+                      f"({len(data) // 1024} kB)")
+    return data
 _XLSX_MIM = ("application/vnd.openxmlformats-officedocument"
              ".spreadsheetml.sheet")
 _DOCX_MIM = ("application/vnd.openxmlformats-officedocument"
@@ -480,137 +547,23 @@ def _doc_bytes(job: dict, kind: str, dnr: str):
     raise HTTPException(400, f"okänt kind '{kind}'")
 
 
-def _doc_kind_meta(kind: str):
-    return {"excel": ("spreadsheet", "xlsx"),
-            "granskning": ("spreadsheet", "xlsx"),
-            "ansokan": ("word", "docx")}[kind]
-
-
-def _jwt_hs256(payload: bytes) -> str:
-    """Enkel HS256-signering om EUROOFFICE_JWT_SECRET är satt på servern."""
-    import base64
-    import hashlib
-    import hmac
-    import json as _json
-    hemligt = os.environ.get("EUROOFFICE_JWT_SECRET", "").encode()
-    if not hemligt:
-        return ""
-    b = base64.urlsafe_b64encode
-    hdr = b(_json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).rstrip(b"=")
-    pld = b(payload).rstrip(b"=")
-    sig = b(hmac.new(hemligt, hdr + b"." + pld, hashlib.sha256).digest()).rstrip(b"=")
-    return f"{hdr.decode()}.{pld.decode()}.{sig.decode()}"
-
-
-def _doc_lockversion(job: dict, kind: str, dnr: str) -> int:
-    return ((job.setdefault("_doc_versions", {})
-            .setdefault((kind, dnr), 0)))
-
-
 @app.get("/r/{jid}/{kind}/{dnr}")
 def eurooffice_rediger(jid: str, kind: str, dnr: str):
-    """Editor-sida: laddar OnlyOffice DocsAPI från eurooffice.berget.ai och
-    pekar på vår fil-endpoint + spar-callback."""
+    """Redirect till Eurooffices example-editor: dokumentet laddas upp via
+    /example/upload (server-side) och hämtas tillbaka via /example/download
+    vid nästa nedladdning."""
     job = JOBS.get(jid)
     if not job:
         raise HTTPException(404, "okänt jobb")
-    data, *_ = _doc_bytes(job, kind, dnr)
-    if not data:
+    if kind not in ("excel", "granskning", "ansokan"):
+        raise HTTPException(400, f"okänt kind '{kind}'")
+    if not _doc_bytes(job, kind, dnr)[0]:
         raise HTTPException(404, "dokumentet är inte klart än")
-    base = _public_base()
-    doc_type, file_type = _doc_kind_meta(kind)
-    version = _doc_lockversion(job, kind, dnr)
-    titel = _doc_bytes(job, kind, dnr)[3]
-    config = {
-        "documentType": doc_type,
-        "document": {
-            "fileType": file_type,
-            "key": f"{jid}-{kind}-{dnr}-v{version}",
-            "title": titel,
-            "url": f"{base}/r-file/{jid}/{kind}/{dnr}",
-            "permissions": {"edit": True, "download": True,
-                            "print": True, "save": True},
-        },
-        "editorConfig": {
-            "callbackUrl": f"{base}/r-save/{jid}/{kind}/{dnr}.json",
-            "mode": "edit",
-            "lang": "sv-SE",
-            "customization": {"autosave": True},
-        },
-        "height": "100%", "width": "100%",
-        "type": "desktop",
-    }
-    import json as _json
-    token = _jwt_hs256(_json.dumps(config, ensure_ascii=False).encode())
-    if token:
-        config["token"] = token
-        config["document"]["permissions"]["review"] = True
-    html = f"""<!doctype html>
-<html lang="sv">
-<head><meta charset="utf-8"><title>{titel} — Eurooffice</title>
-<style>html,body,#placeholder{{height:100%;margin:0;border:0}}</style>
-<script src="{_EUROOFFICE_HOST}/web-apps/apps/api/documents/api.js"></script>
-</head>
-<body><div id="placeholder"></div>
-<script>
-  const config = {_json.dumps(config, ensure_ascii=False)};
-  window.docEditor = new DocsAPI.DocEditor("placeholder", config);
-</script>
-</body></html>"""
-    return Response(content=html, media_type="text/html")
-
-
-@app.get("/r-file/{jid}/{kind}/{dnr}")
-def eurooffice_fil(jid: str, kind: str, dnr: str):
-    job = JOBS.get(jid)
-    if not job:
-        raise HTTPException(404, "okänt jobb")
-    data, _ft, mim, namn = _doc_bytes(job, kind, dnr)
-    if not data:
-        raise HTTPException(404, "dokument saknas")
-    return Response(content=data, media_type=mim,
-                    headers={"Content-Disposition":
-                             f'inline; filename="{namn}"',
-                             "Access-Control-Allow-Origin": "*"})
-
-
-@app.post("/r-save/{jid}/{kind}/{dnr}.json")
-async def eurooffice_spara(jid: str, kind: str, dnr: str,
-                           request: Request):
-    """OnlyOffice spar-callback: status 2 (=spara) / 6 (=spara tvång) —
-    hämta den redigerade filen och lägg tillbaka i job-state."""
-    job = JOBS.get(jid)
-    if not job:
-        raise HTTPException(404, "okänt jobb")
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        body = {}
-    status = body.get("status")
-    if status not in (2, 6):
-        return {"error": 0}
-    url = body.get("url")
-    if not url:
-        return {"error": 0}
-    import urllib.request
-    try:
-        with urllib.request.urlopen(url, timeout=60) as r:
-            ny = r.read()
-    except Exception as e:  # noqa: BLE001
-        job["log"].append(f"⚠️ Eurooffice-sparning misslyckades: {e}")
-        return {"error": 0}
-    if kind == "excel":
-        job.setdefault("_excel", {})[dnr] = ny
-    elif kind == "granskning":
-        job.setdefault("_granskning_xlsx", {})[dnr] = ny
-    elif kind == "ansokan":
-        job.setdefault("_ansokan_docx", {})[dnr] = ny
-    else:
-        return {"error": 0}
-    job["_doc_versions"][(kind, dnr)] = _doc_lockversion(job, kind, dnr) + 1
-    job["log"].append(f"💾 {kind} {dnr} sparat i Eurooffice "
-                      f"({len(ny) / 1024:.0f} kB)")
-    return {"error": 0}
+    filnamn = _eo_ladda_upp(job, kind, dnr)
+    from urllib.parse import quote
+    url = f"{_EO_EXAMPLE}/editor?fileName={quote(filnamn)}&lang=sv-SE&uid=anon"
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url)
 
 app.mount("/", StaticFiles(directory=os.path.join(HERE, "demo_static"),
                            html=True), name="static")

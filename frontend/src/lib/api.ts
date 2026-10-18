@@ -200,6 +200,6 @@ export function redigerUrl(jobId: string, kind: "excel" | "ansokan" | "gransknin
 }
 
 export function dlUrl(jobId: string, kind: "excel" | "ansokan" | "granskning", dnr: string) {
-  const ext = kind === "ansokan" ? "md" : "xlsx";
+  const ext = kind === "ansokan" ? "docx" : (kind === "granskning" || kind === "excel" ? "xlsx" : "md");
   return `/api/download/${jobId}/${kind}/${dnr}.${ext}`;
 }

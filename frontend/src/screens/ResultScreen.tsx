@@ -70,7 +70,7 @@ export default function ResultScreen({
               <DokCard
                 jobId={jobId} dnr={a.dnr} kind="ansokan" ikon="📝"
                 titel="Ansökningshandling" sub="redigerbart utkast i Eurooffice"
-                dlNamn={a.filnamn_md}
+                dlNamn={a.filnamn_md.replace(/\.md$/, ".docx")}
                 extra={
                   <button
                     onClick={() => setVisaMd(visaMd === a.dnr ? null : a.dnr)}
