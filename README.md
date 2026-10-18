@@ -74,6 +74,19 @@ registret — visar "Vi tror det är **X AB** (org.nr). Är det här bolaget?" m
 Ja/alternativ/Nej. Privata domäner (gmail m.fl.) faller tillbaka på att fråga
 om webbadress. Mejlen sparas privat i jobbet och används för resultatmailet.
 
+### Gap-stöd mot hemsidan (granska)
+
+Efter färska-ögon-granskningen letar ett andra varv ("gap-stöd",
+`demo_core.gap_stöd`) upp svar på varje gappunkt **i de sidor som redan
+skrapats på bolagets egen webb** — ingen ny crawl-kostnad. Per punkt väljs
+topp-3 sidorna via tema-hintar (konsortiekrav → case/kunder-sidor, CV/bilagor
+→ team/om-oss-sidor, …) + nyckelordsöverlapp, följt av ett LLM-anrop som
+returnerar fynd (citat + källa), namngivna personer (CV-grund) och
+organisations-kandidater (partners/kunder som kan bilda konsortium). Resultatet
+bifogas på varje granskningspunkt (`stöd`-fält), syns som gröna kort i
+granskningsvyn och hamnar i kolumnen "💡 Gap-stöd från hemsidan" i
+gransknings-Excel för "Skellefteå-användningsfall"-nivåsättning.
+
 ### Redigera i Eurooffice
 
 Knappen "✒ Öppna i Eurooffice ↗" på resultatskärmens dokument-kort går via

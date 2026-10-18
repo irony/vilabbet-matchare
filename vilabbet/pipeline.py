@@ -262,6 +262,13 @@ class PipelineJob:
                     g = {"sammanfattning": f"Granskningen misslyckades: {e}",
                          "punkter": [], "antal": {}}
                 g["filnamn_xlsx"] = f"granskning_{company}_{dnr}.xlsx"
+                # Andra varv: sök svar på gappunkterna i hemsidans sidor
+                try:
+                    demo_core.gap_stöd(g.get("punkter") or [],
+                                       self.job["_company_data"],
+                                       progress=self.logg)
+                except Exception as e:  # noqa: BLE001
+                    self.logg(f"⚠️ gap-stöd mot hemsidan misslyckades: {e}")
                 self.job["granskning"][dnr] = g
                 self.job["_granskning_xlsx"][dnr] = \
                     demo_core.bygg_gransknings_xlsx(res, g, company)

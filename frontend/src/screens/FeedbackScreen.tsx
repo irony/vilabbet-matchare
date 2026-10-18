@@ -96,6 +96,19 @@ export default function FeedbackScreen({
                     <b>Brist:</b> {p.beskrivning}<br />
                     <b>Åtgärd:</b> {p.atgard}
                   </p>
+                  {p.stöd && (
+                    <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 p-2.5 text-[12.5px] leading-snug text-emerald-900">
+                      {p.stöd.förslag && <p>💡 {p.stöd.förslag}</p>}
+                      {(p.stöd.fynd ?? []).slice(0, 2).map((f, i) => f.citat && (
+                        <p key={i} className="mt-1 italic opacity-80">
+                          “{f.citat.slice(0, 180)}”
+                          {f.sida && <a href={f.sida} target="_blank" rel="noreferrer" className="ml-1 underline underline-offset-2 not-italic">källa ↗</a>}
+                        </p>
+                      ))}
+                      {!!p.stöd.personer?.length && <p className="mt-1">👤 {p.stöd.personer.join(", ")}</p>}
+                      {!!p.stöd.organisationer?.length && <p className="mt-1">🏢 Konsortiekandidater: {p.stöd.organisationer.join(", ")}</p>}
+                    </div>
+                  )}
                   <div className="mt-3 flex flex-wrap gap-2.5">
                     <Select value={fy?.status ?? "Ej påbörjad"} onChange={(e) => set(dnr, p.nr, { status: e.target.value })}>
                       {STATUS_VAL.map((o) => <option key={o}>{o}</option>)}

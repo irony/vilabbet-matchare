@@ -80,6 +80,12 @@ export interface GranskningsPunkt {
   avsnitt?: string;
   beskrivning: string;
   atgard: string;
+  stöd?: {
+    fynd?: { sida?: string; citat?: string; kommentar?: string }[];
+    personer?: string[];
+    organisationer?: string[];
+    förslag?: string;
+  };
 }
 
 export interface Granskning {

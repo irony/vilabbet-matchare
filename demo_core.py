@@ -628,6 +628,144 @@ STATUS_TEXT = {"styrkt_uppfyllt": "Styrkt uppfyllt",
 GRANSKA_VIKT = {"blockerare": 0, "viktigt": 1, "förslag": 2}
 
 
+# ---------------------------------------------------------------------------
+# Gap-stöd: andra varvet mot hemsidan för varje gappunkt
+# ---------------------------------------------------------------------------
+
+_GAPTEMAS = [
+    # (nyckelord i punkt-text, url-hintar, etikett)
+    (("konsorti", "partner", "juridisk person", "annat företag",
+      "annan organisation", "samarbet", "tväräg", "innovationspartner"),
+     ("case", "kunder", "referens", "samarbet", "projekt", "uppdrag"),
+     "kund- och samarbetscase"),
+    (("cv", "medarbetare", "team", "komp", "person", "organisation",
+      "sammansätt", "erfarenhet som ska med"),
+     ("om-oss", "team", "medarbetare", "about", "karriar", "folk",
+      "ledning", "vi-ar", "vara-radgivare", "konsult"),
+     "personer och kompetens"),
+    (("budget", "belopp", "kostnad", "finansi", "prissnivå", "omsätt",
+      "stödnivå"),
+     ("pris", "erbjud", "produkt", "arbeten", "sektor", "om-oss"),
+     "siffror och bakgrund"),
+    (("problem", "sektor", "användningsfall", "målgrupp", "bränsle",
+      "sjukvård", "energi", "transport", "försvar", "finans", "välfärd"),
+     ("case", "kunder", "branscher", "sektorer", "losning", "tjanst",
+      "omrade"),
+     "användningsfall/bransch"),
+]
+
+
+def _gap_välj_sidor(punkt: dict, pages: list, max_sidor: int = 3) -> list:
+    """Välj de mest sannolika sidorna för just den här gap-punkten:
+    tema-hintar på URL + ordöverlappnedgång i sidtexten."""
+    text = f"{punkt.get('beskrivning') or ''} {punkt.get('atgard') or ''}".lower()
+    trähintar, tema = [], ""
+    for ordar, hintar, etikett in _GAPTEMAS:
+        if any(o in text for o in ordar):
+            trähintar.extend(hintar)
+            tema = etikett
+            break
+    stop = {"som", "och", "för", "med", "inte", "detta", "avsnitt", "ska",
+            "the", "den", "att", "är", "har", "från", "omfatt", "projekt",
+            "utkast", "ansökan", "bolaget", "saknas", "ange", "exakt",
+            "konkret", "behöver", "måste", "text", "formulär", "uppfyll"}
+    ord = {w for w in re.findall(r"[a-zåäö]{5,}", text) if w not in stop}
+    sorterade = []
+    for p in pages:
+        url = (p.get("url") or "").lower()
+        md = (p.get("markdown") or "")
+        md_low = md.lower()
+        poäng = sum(3 for h in trähintar if h in url)
+        poäng += min(9, sum(1 for w in ord if w in md_low))
+        if poäng > 0:
+            sorterade.append((poäng, p))
+    sorterade.sort(key=lambda par: par[0], reverse=True)
+    valda = [p for _poäng, p in sorterade[:max_sidor]]
+    if not valda:
+        valda = pages[:max_sidor]  # fallback: första sidorna
+    return valda, tema or "allmänt"
+
+
+def gap_stöd(punkter: list, company_data: dict, progress=None,
+             model: str = "default", max_punkter: int = 9):
+    """Andra varv mot hemsidan: leta svar på varje gappunkt i de skrapade
+    sidorna (crawl+motore-signatur) — personer/CV, kunder som kan bli
+    konsortiepartner, tidiga case, konkreta siffror. Muterar 'punkter'
+    in-place med fältet 'stöd'."""
+    pages = company_data.get("pages") or []
+    if not pages or not punkter:
+        return
+    company = company_data.get("company", "bolaget")
+    # prioritet: blockerare > viktigt > förslag — ta de max_punkter första
+    valbara = sorted(punkter,
+                     key=lambda p: (GRANSKA_VIKT.get(p.get("allvar"), 9),
+                                    p.get("nr", 99)))[:max_punkter]
+    _tell(progress,
+          f"Letar svar på {len(valbara)} gappunkter i hemsidans "
+          f"{len(pages)} sidor …",
+          {"kind": "note", "title": "🔎 Gap-stöd mot hemsidan",
+           "sub": f"{len(valbara)} punkter × {len(pages)} sidor"})
+
+    def _en(p):
+        valda, tema = _gap_välj_sidor(p, pages)
+        material = "\n\n".join(
+            f"### {s['url']}\n{s.get('markdown', '')[:4800]}" for s in valda)
+        prompt = f"""Du hjälper {company} att stryka luckorna i deras
+ansökningsutkast. Här är en granskningspunkt, och här är sidorna från
+bolagets egen webbplats (färskt skrapad).
+
+GRANSKNINGSPUNKT ({p.get('kategori')} / {p.get('allvar')}):
+Beskrivning: {p.get('beskrivning')}
+Åtgärd som efterfrågas: {p.get('atgard')}
+
+SIDOR (fokus-läge: {tema}):
+{material[:15000]}
+
+Leta i sidmaterialet efter det som kan fylla luckan:
+- t.ex. namngivna personer eller team som hade kunnat vara i ansökan (CV-start)
+- tidigare kunder/samarbetspartners som kan bilda konsortium eller ge lärdom
+- konkreta siffror, ska-l, erfarenhetsord, branschlabels
+- ALLT i materialet som gör punkten enklare för bolaget att åtgärda
+
+Svara ENBART med JSON:
+{{"hittade": true/false,
+  "fynd": [{{"sida": "url", "citat": "≤220 tecken från sidan",
+             "kommentar": "1 mening om varför det hjälper"}}],
+  "personer": ["namn eller roll"],
+  "organisationer": ["org-namn som nämns som kund/partner på sidorna"],
+  "förslag": "1–3 meningar: konkret hur bolaget utnyttjar fyndet mot gapet"}}"""
+        try:
+            content, _ = chat([{"role": "user", "content": prompt}],
+                              model=model, max_tokens=1500, temperature=0.0)
+            j = json.loads(content[content.index("{"):content.rindex("}") + 1])
+        except Exception:  # noqa: BLE001
+            return
+        stöd = {
+            "fynd": [f for f in (j.get("fynd") or [])[:4] if f.get("citat")],
+            "personer": [s for s in (j.get("personer") or [])[:6] if s][:6],
+            "organisationer": [s for s in (j.get("organisationer") or [])[:8]
+                               if s][:8],
+            "förslag": str(j.get("förslag") or "").strip(),
+        }
+        if stöd["fynd"] or stöd["förslag"]:
+            p["stöd"] = stöd
+            _tell(progress,
+                  f"  ✓ #{p.get('nr')} {p.get('avsnitt') or ''}: "
+                  f"{len(stöd['fynd'])} fynd",
+                  {"kind": "note",
+                   "title": f"🔎 Gap #{p.get('nr')} stöttad",
+                   "sub": f"{len(stöd['fynd'])} fynd, "
+                          f"{len(stöd['organisationer'])} org-kandidater"})
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(_en, valbara))
+    funna = sum(1 for p in valbara if p.get("stöd"))
+    _tell(progress, f"  ✓ gap-stöd klart: {funna}/{len(valbara)} punkter "
+                    f"fick stöd", {"kind": "motor",
+                                  "title": "Gap-stöd klart",
+                                  "sub": f"{funna} av {len(valbara)}"})
+
+
 def granska_ansokan(res, ansokan_md, progress=None, model="default"):
     """Läs ansökningsutkastet mot utlysningen — vad saknas främst?
 
@@ -765,7 +903,8 @@ def bygg_gransknings_xlsx(res, granskning, company, fyllning=None):
     HDR_FILL = PatternFill("solid", fgColor="111816")
     ws.append(["Nr", "Kategori", "Allvar", "Krav", "Avsnitt i ansökan",
                "Brist / vad som saknas", "Åtgärd som behövs",
-               "Status", "Ansvarig", "Kommentar"])
+               "Status", "Ansvarig", "Kommentar",
+               "💡 Gap-stöd från hemsidan"])
     for c in ws[1]:
         c.font = Font(bold=True, color="FFFFFF")
         c.fill = HDR_FILL
@@ -777,14 +916,27 @@ def bygg_gransknings_xlsx(res, granskning, company, fyllning=None):
     punkter = granskning.get("punkter") or []
     for p in punkter:
         fylld = ifyllda.get(str(p["nr"])) or ifyllda.get(p["nr"]) or {}
+        stöd = p.get("stöd") or {}
+        stödtexter = []
+        if stöd.get("förslag"):
+            stödtexter.append(stöd["förslag"])
+        for f in (stöd.get("fynd") or [])[:3]:
+            stödtexter.append(f"“{str(f.get('citat'))[:160]}”"
+                              f" ({_korta(f.get('sida'), 60)})")
+        if stöd.get("personer"):
+            stödtexter.append("Personer: " + ", ".join(stöd["personer"]))
+        if stöd.get("organisationer"):
+            stödtexter.append("Org-kandidater: "
+                              + ", ".join(stöd["organisationer"]))
         ws.append([p["nr"], KAT_TEXT.get(p["kategori"], p["kategori"]),
                    p["allvar"].capitalize(), p.get("krav_id") or "",
                    p.get("avsnitt") or "", p.get("beskrivning") or "",
                    p.get("atgard") or "", fylld.get("status") or "Ej påbörjad",
-                   fylld.get("ansvarig") or "", fylld.get("kommentar") or ""])
+                   fylld.get("ansvarig") or "", fylld.get("kommentar") or "",
+                   "\n".join(stödtexter)[:900]])
         ws.cell(row=ws.max_row, column=3).fill = PatternFill(
             "solid", fgColor=ALLVAR_FARG.get(p["allvar"], "FFFFFF"))
-    bredd = [5, 15, 12, 14, 22, 48, 42, 14, 16, 30]
+    bredd = [5, 15, 12, 14, 22, 48, 42, 14, 16, 30, 52]
     for i, b in enumerate(bredd, 1):
         ws.column_dimensions[get_column_letter(i)].width = b
     for r in ws.iter_rows(min_row=2):
