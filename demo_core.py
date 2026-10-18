@@ -565,6 +565,219 @@ STATUS_TEXT = {"styrkt_uppfyllt": "Styrkt uppfyllt",
                "okant": "Okänt — att komplettera",
                "strukturellt": "Strukturkrav"}
 
+# --------------------------------------------------- färska-ögon-granskning
+# Granskaren läser UTKASTET mot UTLYSNINGEN — inget från bolagswebben används,
+# bara utlysningens villkor och kravmatrisens status. Det är avsikten:
+# granskningen ska vara bolagsblind, som en extern utvärderare.
+
+GRANSKA_VIKT = {"blockerare": 0, "viktigt": 1, "förslag": 2}
+
+
+def granska_ansokan(res, ansokan_md, progress=None, model="default"):
+    """Läs ansökningsutkastet mot utlysningen — vad saknas främst?
+
+    Returnerar {"sammanfattning": str, "punkter": [...]} där varje punkt är
+    {"kategori", "allvar", "krav_id"|None, "avsnitt", "beskrivning", "atgard"}.
+    """
+    dnr = res["dnr"]
+    form_fragor = []
+    try:
+        d = api_get(f"/v1/rounds/{dnr}/form").get("data", {})
+        form_fragor = d.get("questions") or []
+    except Exception:  # noqa: BLE001
+        form_fragor = []
+
+    krav_med_status = []
+    for k in res.get("krav") or []:
+        st = STATUS_TEXT.get(k.get("status"), k.get("status"))
+        krav_med_status.append(
+            f"- [{k.get('id') or k.get('requirement_id')}] {st}: "
+            f"{_korta(k.get('text'), 200)}"
+            + (f" (kommentar: {_korta(k.get('fakta') or k.get('kommentar'), 120)})"
+               if (k.get("fakta") or k.get("kommentar")) else ""))
+    fragelista = "\n".join(
+        f"- {_korta(q.get('question') or q.get('text') or q.get('label'), 150)}"
+        for q in form_fragor[:20]) or "- (korpuset saknar formulärfrågor)"
+    motor = res.get("motor") or {}
+    motortxt = (f"Officiella regelmotorn: eligible={motor.get('eligible')} — "
+                + _korta(motor.get("explanation"), 300)) if motor else \
+        "Officiella regelmotorn har inte kunnat avgöra (saknar party-fakta)."
+
+    prompt = f"""Du är en väldigt erfaren granskare av ansökningar till {res.get('funder') or 'finansiären'}.
+Du har ALDRIG sett bolaget förut — du bedömer BARA utkastet mot utlysningen.
+Ingen webbinformation om bolaget finns tillgänglig: allt du behöver veta måste
+stå i ansökningsutkastet självt. Det är exakt så en granskande läsare möter
+ansökan i verkligheten.
+
+UTLYSNING: {res['title']} ({dnr}), finansiär: {res.get('funder') or ''}
+Stänger: {str(res.get('closing_date'))[:10]}
+Vem kan söka: {res.get('who') or '–'}
+
+{motortxt}
+
+FORMULÄRFRÅGOR I UTLYSNINGEN:
+{fragelista}
+
+KRAVENS STATUS UR KRAVMATRISEN (inte fyllbara i utkastet, men vägleder prio):
+{chr(10).join(krav_med_status[:60])}
+
+ANSÖKNINGSUTKAST (markdown):
+---
+{ansokan_md[:16000]}
+---
+
+Läs igenom utkastet KRITISKT mot utlysningen och lista vad som FRÄMST saknas
+eller är för svagt innan ansökan kan lämnas in. Tänk på: formalia (belopp,
+datum, diarienummer, underskrift, obligatoriska bilagor), obesvarade
+formulärfrågor eller "ATT KOMPLETTERA"-lådor, krav som riskerar att underkännas,
+svag eller icke-undantagslös argumentstyrka, motsägelser mot utlysningstexten.
+
+Svara ENBART med JSON i exakt detta format:
+{{"sammanfattning": "3–6 meningar om läget — vad som främst saknas totalt.",
+  "punkter": [{{"kategori": "formalia|formulärfråga|krav|bristande_bevis|svagt_argument|motsägelse",
+               "allvar": "blockerare|viktigt|förslag",
+               "krav_id": "kravets id om kopplat, annars null",
+               "avsnitt": "vilket ställe i ansökan det hör till",
+               "beskrivning": "vad som saknas eller är svagt, konkret",
+               "atgard": "vad som faktiskt behöver göras, konkret"}}]}}
+
+Högst 30 punkter, ordnat med blockerare först. Var konkret och hänvisa till
+utlysningens villkor, inte till allmänna ansökningstips."""
+    _tell(progress, f"Granskar {dnr} med färska ögon …",
+          {"kind": "form", "title": "🔍 Färska-ögon-granskning",
+           "sub": _korta(res["title"], 70)})
+    content, usage = chat([{"role": "user", "content": prompt}],
+                          model=model, max_tokens=6000, temperature=0.0)
+    try:
+        g = json.loads(content[content.index("{"):content.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        g = {"sammanfattning": "", "punkter": []}
+    punkter = g.get("punkter") or []
+    tillåtna_kat = {"formalia", "formulärfråga", "krav", "bristande_bevis",
+                    "svagt_argument", "motsägelse"}
+    rensade = []
+    for i, p in enumerate(punkter[:30], 1):
+        if not isinstance(p, dict):
+            continue
+        rensade.append({
+            "nr": i,
+            "kategori": str(p.get("kategori") or "krav").strip().lower()
+            if str(p.get("kategori") or "").strip().lower() in tillåtna_kat
+            else "krav",
+            "allvar": str(p.get("allvar") or "viktigt").strip().lower()
+            if str(p.get("allvar") or "").strip().lower() in GRANSKA_VIKT
+            else "viktigt",
+            "krav_id": p.get("krav_id") or None,
+            "avsnitt": _korta(p.get("avsnitt"), 100),
+            "beskrivning": str(p.get("beskrivning") or "").strip(),
+            "atgard": str(p.get("atgard") or "").strip(),
+        })
+    rensade.sort(key=lambda p: (GRANSKA_VIKT.get(p["allvar"], 9), p["nr"]))
+    for i, p in enumerate(rensade, 1):
+        p["nr"] = i
+    antal = {"blockerare": 0, "viktigt": 0, "förslag": 0}
+    for p in rensade:
+        antal[p["allvar"]] = antal.get(p["allvar"], 0) + 1
+    _tell(progress,
+          f"  ✓ granskning klar: {antal['blockerare']} blockerare, "
+          f"{antal['viktigt']} viktiga",
+          {"kind": "motor",
+           "title": f"Granskning: {antal['blockerare']} blockerare · "
+                    f"{antal['viktigt']} viktiga",
+           "sub": _korta(res["title"], 60)})
+    return {"sammanfattning": str(g.get("sammanfattning") or "").strip(),
+            "punkter": rensade, "antal": antal}
+
+
+def bygg_gransknings_xlsx(res, granskning, company, fyllning=None):
+    """Granskningsformuläret som Excel — med statusdropdown från rad 2.
+
+    fyllning: valfri dict {"punkter": {nr: {"status","ansvarig","kommentar"}},
+                           "kommentar": str} — redan insamlade svar som ska
+    vara ifyllda i arket."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    fyllning = fyllning or {}
+    ifyllda = (fyllning.get("punkter") or {}) if isinstance(fyllning, dict) else {}
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Granskning"
+    HDR_FILL = PatternFill("solid", fgColor="111816")
+    ws.append(["Nr", "Kategori", "Allvar", "Krav", "Avsnitt i ansökan",
+               "Brist / vad som saknas", "Åtgärd som behövs",
+               "Status", "Ansvarig", "Kommentar"])
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = HDR_FILL
+        c.alignment = Alignment(vertical="center")
+    ALLVAR_FARG = {"blockerare": "FEE2E2", "viktigt": "FEF3C7", "förslag": "DBEAFE"}
+    KAT_TEXT = {"formalia": "Formalia", "formulärfråga": "Formulärfråga",
+                "krav": "Krav", "bristande_bevis": "Bristande bevis",
+                "svagt_argument": "Svagt argument", "motsägelse": "Motsägelse"}
+    punkter = granskning.get("punkter") or []
+    for p in punkter:
+        fylld = ifyllda.get(str(p["nr"])) or ifyllda.get(p["nr"]) or {}
+        ws.append([p["nr"], KAT_TEXT.get(p["kategori"], p["kategori"]),
+                   p["allvar"].capitalize(), p.get("krav_id") or "",
+                   p.get("avsnitt") or "", p.get("beskrivning") or "",
+                   p.get("atgard") or "", fylld.get("status") or "Ej påbörjad",
+                   fylld.get("ansvarig") or "", fylld.get("kommentar") or ""])
+        ws.cell(row=ws.max_row, column=3).fill = PatternFill(
+            "solid", fgColor=ALLVAR_FARG.get(p["allvar"], "FFFFFF"))
+    bredd = [5, 15, 12, 14, 22, 48, 42, 14, 16, 30]
+    for i, b in enumerate(bredd, 1):
+        ws.column_dimensions[get_column_letter(i)].width = b
+    for r in ws.iter_rows(min_row=2):
+        for c in r:
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    dv = DataValidation(type="list",
+                        formula1='"Ej påbörjad,Pågår,Löst,Behöver ej"',
+                        allow_blank=True, showDropDown=False)
+    dv.error = "Välj: Ej påbörjad, Pågår, Löst eller Behöver ej"
+    dv.errorTitle = "Ogiltigt värde"
+    ws.add_data_validation(dv)
+    dv.add(f"H2:H{len(punkter) + 1}")
+
+    ws2 = wb.create_sheet("Om granskningen")
+    ws2.column_dimensions["A"].width = 22
+    ws2.column_dimensions["B"].width = 90
+    ws2.append(["Post", "Innehåll"])
+    for c in ws2[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = HDR_FILL
+    import time as _time
+    rader = [
+        ("Bolag", company),
+        ("Omgång", f"{res['title']} ({res['dnr']})"),
+        ("Genererad", _time.strftime("%Y-%m-%d")),
+        ("Sammanfattning", granskning.get("sammanfattning") or ""),
+        ("Antal blockerare", (granskning.get("antal") or {}).get("blockerare", 0)),
+        ("Antal viktiga", (granskning.get("antal") or {}).get("viktigt", 0)),
+        ("Antal förslag", (granskning.get("antal") or {}).get("förslag", 0)),
+        ("Formulärkommentar", fyllning.get("kommentar") or ""),
+        ("Metod", "LLM-granskning av utkastet mot utlysningens villkor — "
+                  "bolagsblind läsning (som en extern utvärderare). "
+                  "Kravmatrisens status vägledde prioriteringen."),
+        ("Obs", "Granskningen är ett AI-utkast — alla punkter måste "
+                "granskas av människa innan inlämning."),
+    ]
+    for r in rader:
+        ws2.append(list(r))
+    for r in ws2.iter_rows(min_row=2):
+        for c in r:
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 
 def build_kravmatris_xlsx(res, bolagsnamn=""):
     """Kravmatris som .xlsx-bytes: alla krav + bevisstatus + källa."""

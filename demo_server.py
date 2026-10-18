@@ -59,7 +59,8 @@ def logger(job):
 def job_public(job):
     return {k: v for k, v in job.items()
             if k not in ("log", "_company_data", "_bolagsfakta",
-                         "_kravobj", "_results_full", "_excel")} | {
+                         "_kravobj", "_results_full", "_excel",
+                         "_granskning_xlsx")} | {
         "step": job["log"][-1] if job["log"] else job["phase"],
         "log": job["log"][-8:],
         "items": job["items"],
@@ -205,6 +206,27 @@ def run_docs(jid, job):
             log({"kind": "doc_done", "dnr": dnr, "doc": "ansokan",
                  "title": f"📝 Ansökningshandling {dnr}",
                  "sub": "utkast för mänsklig granskning"})
+        # --- fas 4: färska-ögon-granskning, bolagsblind ---
+        job["phase"] = "granskar"
+        job["granskning"] = {}
+        job["_granskning_xlsx"] = {}
+        for res in results:
+            dnr = res["dnr"]
+            md = next((a["md"] for a in job["docs"]["ansokningar"]
+                       if a["dnr"] == dnr), "")
+            try:
+                g = demo_core.granska_ansokan(res, md, progress=log)
+            except Exception as e:  # noqa: BLE001
+                g = {"sammanfattning": f"Granskningen misslyckades: {e}",
+                     "punkter": [], "antal": {}}
+            g["filnamn_xlsx"] = f"granskning_{company}_{dnr}.xlsx"
+            job["granskning"][dnr] = g
+            job["_granskning_xlsx"][dnr] = demo_core.bygg_gransknings_xlsx(
+                res, g, company)
+            log({"kind": "doc_done", "dnr": dnr, "doc": "granskning",
+                 "title": f"🔍 Granskning {dnr}",
+                 "sub": f"{len(g['punkter'])} punkter — "
+                        f"{(g.get('antal') or {}).get('blockerare', 0)} blockerare"})
         job["phase"] = "klar"
     except Exception as e:  # noqa: BLE001
         job["error"] = str(e)
@@ -305,6 +327,51 @@ def dl_ansokan(jid: str, dnr: str):
     if not a:
         raise HTTPException(404)
     return PlainTextResponse(a["md"], media_type="text/markdown; charset=utf-8")
+
+
+@app.get("/api/download/{jid}/granskning/{dnr}.xlsx")
+def dl_granskning(jid: str, dnr: str):
+    """Granskningsformuläret som Excel; återfyllt om formuläret sparats."""
+    job = JOBS.get(jid)
+    g = (job or {}).get("granskning", {}).get(dnr)
+    res = next((r for r in (job or {}).get("_results_full", [])
+                if r["dnr"] == dnr), None) if job else None
+    if not g or not res:
+        raise HTTPException(404)
+    fyllning = ((job.get("feedback") or {}).get(dnr)) if job else None
+    if fyllning:
+        data = demo_core.bygg_gransknings_xlsx(res, g, job["company"],
+                                               fyllning=fyllning)
+    else:
+        data = job["_granskning_xlsx"].get(dnr)
+    if not data:
+        raise HTTPException(404)
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument"
+                   ".spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 f'attachment; filename="granskning_{job["company"]}_{dnr}.xlsx"'})
+
+
+class FeedbackIn(BaseModel):
+    job_id: str
+    dnrs: dict          # dnr -> {"punkter": {nr: {...}}, "kommentar": str}
+
+
+@app.post("/api/feedback")
+def feedback(inp: FeedbackIn):
+    """Sparar det ifyllda granskningsformuläret (per ansökan)."""
+    job = JOBS.get(inp.job_id)
+    if not job:
+        raise HTTPException(404, "okänt jobb")
+    job.setdefault("feedback", {})
+    n = 0
+    for dnr, data in inp.dnrs.items():
+        job["feedback"][dnr] = data
+        n += len((data.get("punkter") or {}) if isinstance(data, dict) else {})
+    job["log"].append(f"Granskningsformulär sparat — {n} svar ifyllda")
+    return {"ok": True, "svar": n}
 
 
 app.mount("/", StaticFiles(directory=os.path.join(HERE, "demo_static"),

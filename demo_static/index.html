@@ -258,6 +258,32 @@
   #org-suggest .sg span { color: var(--muted); font-size: 12.5px; }
   #org-confirm { font-size: 13px; color: var(--ok); margin-top: 7px;
     display: none; }
+  /* ---- granskning (färska ögon) ---- */
+  .feedback-round { max-width: 900px; }
+  .granskning-dl { margin: 10px 0 16px; font-size: 14.5px; }
+  .granskning-dl a { color: var(--accent); text-decoration: none;
+    border-bottom: 1px solid var(--accent); }
+  .fbrow { background: #fff; border: 1.5px solid var(--line);
+    border-radius: 14px; padding: 14px 18px; margin: 10px 0; }
+  .fbrow .fhead { display: flex; flex-wrap: wrap; gap: 8px;
+    align-items: center; }
+  .fbrow .chip { font-size: 11.5px; font-weight: 650; padding: 2px 10px;
+    border-radius: 999px; }
+  .fbrow .chip.bad { background: #fee2e2; color: #7f1d1d; }
+  .fbrow .chip.warn { background: #fef3c7; color: #854d0e; }
+  .fbrow .chip.ok { background: #dcfce7; color: #14532d; }
+  .fbrow .chip.kat { background: var(--accent-soft); color: var(--accent); }
+  .fbrow .chip.krav { background: #f3f4f6; color: var(--muted); }
+  .fbrow .favsnitt { font-size: 12.5px; color: var(--muted);
+    font-style: italic; }
+  .fbrow .fbody { font-size: 13.5px; margin-top: 8px; line-height: 1.5; }
+  .fbrow .finputs { display: flex; gap: 10px; margin-top: 10px;
+    flex-wrap: wrap; }
+  .fbrow .finputs select { font-size: 12.5px; padding: 5px 8px;
+    border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  .fbrow .finputs input { font-size: 12.5px; padding: 5px 10px;
+    border: 1px solid var(--line); border-radius: 8px; flex: 1;
+    min-width: 140px; }
   @media (max-width: 700px) { .screen { padding: 6vh 7vw; } }
 </style>
 </head>
@@ -334,6 +360,7 @@
     <h1 id="analysis-title" style="font-size: clamp(26px, 4vw, 38px)">
       Samlar kravbilden och letar bevis…</h1>
     <div class="log" id="analysis-log" style="min-height:0"></div>
+    <div id="reqcount" style="font-size:13px;color:var(--muted);margin:10px 0 14px"></div>
     <div id="reqlist"></div>
   </div>
 </section>
@@ -360,7 +387,26 @@
   <div class="docs" id="download-row" hidden>
     <a class="btn ghost" id="dl-md" download>Ladda ner markdown</a>
   </div>
+  <div style="margin-top:28px">
+    <button class="btn" id="btn-feedback" hidden>🔍 Visa granskningen ↵</button>
+  </div>
   <div class="hint">tryck <kbd>r</kbd> för att börja om</div>
+</section>
+
+<!-- 8: färska-ögon-granskning (formulär) -->
+<section class="screen" id="s-feedback">
+  <div class="eyebrow">Sista steget</div>
+  <h1>Granskning med färska ögon</h1>
+  <p class="lead">Utkasten lästes om mot utlysningen — bolagsblint, som en
+    extern granskare. Fyll i status per punkt eller hämta hem alla punkter
+    som ifyllbart Excel-ark.</p>
+  <div id="feedback-list"></div>
+  <div style="margin-top:26px; display:flex; gap:12px; flex-wrap:wrap">
+    <button class="btn" id="btn-feedback-save">Spara formuläret ✓</button>
+    <button class="btn ghost" id="btn-feedback-back">← Tillbaka till dokumenten</button>
+  </div>
+  <div class="hint" id="feedback-hint">status sparas på servern; hämta hem
+    Excelfilen efter att du sparat för ifylld version</div>
 </section>
 
 <!-- fel -->
@@ -379,7 +425,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const screens = ["s-url","s-work","s-summary","s-pick","s-kravsum",
-  "s-analysis","s-bevissum","s-result"];
+  "s-analysis","s-bevissum","s-result","s-feedback"];
 let current = 0, jobId = null, pollTimer = null, sel = new Set();
 let docs = null, showing = null, lastItem = 0, lastJob = null;
 
@@ -444,6 +490,12 @@ const REQ_CLASS = { styrkt_uppfyllt: "ok", okant: "miss",
 const REQ_GLYPH = { styrkt_uppfyllt: "✅", okant: "⚪",
   styrkt_ej_uppfyllt: "⚠️", strukturellt: "📋" };
 let reqTotal = 0, reqDone = 0, idxMap = {};
+function updateReqCounter() {
+  const el = $("reqcount");
+  if (el) el.textContent = reqDone < reqTotal
+    ? `Letar bevis — ${reqDone}/${reqTotal} krav prövade …`
+    : reqTotal ? `Alla ${reqTotal} krav prövade` : "";
+}
 const VÄRSTA = ["styrkt_ej_uppfyllt", "okant", "strukturellt",
                 "styrkt_uppfyllt"];
 function buildChecklista(j) {
@@ -619,6 +671,8 @@ function poll(kontext) {
       if (kontext === "fortsatt" && j.phase === "klar") {
         clearInterval(pollTimer); visorResultat(j);
       }
+      if (kontext === "fortsatt" && j.phase === "granskar")
+        $("analysis-title").textContent = "Granskar med färska ögon …";
       if (kontext === "analys" && j.phase === "dokumenterar")
         $("analysis-title").textContent = "Skriver dokumenten…";
     } catch (e) { clearInterval(pollTimer); fail(e.message); }
@@ -645,10 +699,10 @@ function visaSummary(j) {
     ? chips.map(([k, v]) => `<div class="fact"><b>${v}</b><span>${k}</span></div>`).join("")
     : `<div class="fact"><b>📄</b><span>bolagsregistret gav ingen träff —
        vi baserar på webbplatsen</span></div>`;
-  const källa = f.kalla ? `underlag: er webbplats + ${f.kalla}`
-    : "underlag: er webbplats + offentliga register";
-  $("s-summary").querySelector(".hint").textContent = källa +
-    (f.register_driven ? " (Bolagsverkets officiella register)" : "");
+  const källa = f.register_driven
+    ? `underlag: er webbplats + ${f.kalla} (Bolagsverkets officiella register)`
+    : "underlag: er webbplats";
+  $("s-summary").querySelector(".hint").textContent = källa;
   $("sum-profile").innerHTML = (j.profil || "Kunde inte sammanfatta bolaget.")
     .replace(/</g, "&lt;")
     .split("\n")
@@ -724,16 +778,26 @@ function renderKravSum(j) {
     `Gå vidare — leta bevis (${(j.kravsum||[]).length} omgångar) ↵`;
   show("s-kravsum");
 }
-$("btn-kravsum-back").onclick = () => { show("s-pick"); };
+function tillBackaTillVal() {
+  const b = $("btn-pick");
+  b.disabled = sel.size === 0;
+  b.textContent = "Analysera valda ↵";
+  show("s-pick");
+}
+$("btn-kravsum-back").onclick = tillBackaTillVal;
 $("btn-kravsum-go").onclick = async () => {
-  buildChecklista(lastJob || {});
-  $("analysis-title").textContent = "Letar bevis i er textmassa…";
-  show("s-analysis");
+  const b = $("btn-kravsum-go");
+  if (b.disabled) return;
+  b.disabled = true;
   try {
+    buildChecklista(lastJob || {});
+    $("analysis-title").textContent = "Letar bevis i er textmassa…";
+    show("s-analysis");
     await api("/api/analysera", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({job_id: jobId})});
     poll("analys");
   } catch (e) { fail(e.message); }
+  finally { b.disabled = false; }
 };
 
 // ---- bevissummering (grinden efter faktainhämtningen)
@@ -756,7 +820,7 @@ function renderBevisSum(j) {
   });
   show("s-bevissum");
 }
-$("btn-bevis-back").onclick = () => { show("s-pick"); };
+$("btn-bevis-back").onclick = tillBackaTillVal;
 /* ---- dokument-skelett ---- */
 function renderDocSkeletons(results) {
   let wrap = $("docskel");
@@ -795,14 +859,18 @@ function applyDocDone(it) {
 }
 
 $("btn-bevis-go").onclick = async () => {
-  renderDocSkeletons((lastJob || {}).results);
-  $("analysis-title").textContent = "Skriver dokumenten …";
-  show("s-analysis");
+  const b = $("btn-bevis-go");
+  if (b.disabled) return;
+  b.disabled = true;
   try {
+    renderDocSkeletons((lastJob || {}).results);
+    $("analysis-title").textContent = "Skriver dokumenten …";
+    show("s-analysis");
     await api("/api/fortsatt", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({job_id: jobId})});
     poll("fortsatt");
   } catch (e) { fail(e.message); }
+  finally { b.disabled = false; }
 };
 
 // ---- steg 4: resultat
@@ -847,8 +915,92 @@ function visorResultat(j) {
   });
   $("result-title").textContent =
     `Dokument för ${j.company} — en kravmatris och en ansökningshandling per ansökan`;
+  $("btn-feedback").hidden = !(j.granskning &&
+    Object.values(j.granskning).some(g => (g.punkter || []).length > 0));
   show("s-result");
 }
+
+// ---- granskning med färska ögon (formulär) ----
+const ALLVAR_CHIP = { blockerare: ["blockerare", "bad"],
+  viktigt: ["viktigt", "warn"], förslag: ["förslag", "ok"] };
+const KAT_CHIP = { formalia: "Formalia", "formulärfråga": "Formulärfråga",
+  krav: "Krav", bristande_bevis: "Bristande bevis",
+  svagt_argument: "Svagt argument", motsägelse: "Motsägelse" };
+const STATUS_VAL = ["Ej påbörjad", "Pågår", "Löst", "Behöver ej"];
+let feedbackJob = null;
+
+function renderFeedback(j) {
+  feedbackJob = j;
+  const el = $("feedback-list"); el.innerHTML = "";
+  const g = j.granskning || {};
+  Object.keys(g).forEach(dnr => {
+    const gr = g[dnr];
+    if (!(gr.punkter || []).length) return;
+    const a = (j.docs?.ansokningar || []).find(x => x.dnr === dnr) || { title: dnr };
+    const grp = document.createElement("div");
+    grp.className = "feedback-round";
+    const ant = gr.antal || {};
+    grp.innerHTML = `<h2 style="margin:6px 0 4px">${a.title}
+        <span class="pill">${dnr}</span></h2>
+      <div class="row" style="margin-bottom:8px">
+        <span class="stat bad">🛑 ${ant.blockerare||0} blockerare</span>
+        <span class="stat warn">⚠️ ${ant.viktigt||0} viktiga</span>
+        <span class="stat ok">💡 ${ant["förslag"]||0} förslag</span>
+      </div>
+      <p style="max-width:760px;font-size:14.5px;color:var(--muted)">${gr.sammanfattning || ""}</p>
+      <div class="granskning-dl"><a href="/api/download/${jobId}/granskning/${dnr}.xlsx"
+        download="granskning_${j.company}_${dnr}.xlsx">📊 Hämta gransknings-Excel (${dnr})</a></div>`;
+    gr.punkter.forEach(p => {
+      const row = document.createElement("div");
+      row.className = "fbrow";
+      const [atxt, aklass] = ALLVAR_CHIP[p.allvar] || ["?", ""];
+      const kat = KAT_CHIP[p.kategori] || p.kategori;
+      row.innerHTML = `
+        <div class="fhead">
+          <span class="chip kat">${kat}</span>
+          <span class="chip ${aklass}">${atxt}</span>
+          ${p.krav_id ? `<span class="chip krav">${p.krav_id}</span>` : ""}
+          <span class="favsnitt">${p.avsnitt || ""}</span>
+        </div>
+        <div class="fbody">
+          <b>Brist:</b> ${p.beskrivning}<br>
+          <b>Åtgärd:</b> ${p.atgard}
+        </div>
+        <div class="finputs" data-nr="${p.nr}">
+          <select class="fstatus">${STATUS_VAL.map(o =>
+            `<option${o === "Ej påbörjad" ? " selected" : ""}>${o}</option>`).join("")}</select>
+          <input class="fansvarig" placeholder="Ansvarig" type="text">
+          <input class="fkommentar" placeholder="Kommentar" type="text">
+        </div>`;
+      row.dataset.dnr = dnr;
+      grp.appendChild(row);
+    });
+    el.appendChild(grp);
+  });
+}
+
+$("btn-feedback").onclick = () => { renderFeedback(lastJob); show("s-feedback"); };
+$("btn-feedback-back").onclick = () => show("s-result");
+$("btn-feedback-save").onclick = async () => {
+  const dnrs = {};
+  document.querySelectorAll("#feedback-list .fbrow").forEach(row => {
+    const dnr = row.dataset.dnr;
+    const nr = row.querySelector(".finputs").dataset.nr;
+    (dnrs[dnr] ||= { punkter: {}, kommentar: "" });
+    dnrs[dnr].punkter[nr] = {
+      status: row.querySelector(".fstatus").value,
+      ansvarig: row.querySelector(".fansvarig").value,
+      kommentar: row.querySelector(".fkommentar").value,
+    };
+  });
+  try {
+    const r = await api("/api/feedback", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, dnrs }) });
+    $("feedback-hint").textContent =
+      `✓ sparat (${r.svar} svar) — hämta hem granskning-Excels nu om du vill se ifylld version`;
+  } catch (e) { $("feedback-hint").textContent = "Kunde inte spara: " + e.message; }
+};
 
 // ---- navigering
 $("btn-start").onclick = start;
@@ -858,6 +1010,7 @@ document.addEventListener("keydown", e => {
   else if (e.key === "Enter" && current === 3 && sel.size > 0) $("btn-pick").click();
   else if (e.key === "Enter" && current === 4) $("btn-kravsum-go").click();
   else if (e.key === "Enter" && current === 6) $("btn-bevis-go").click();
+  else if (e.key === "Enter" && current === 7 && !$("btn-feedback").hidden) $("btn-feedback").click();
   else if (e.key === "r" && current === 7) location.reload();
   else if (e.key === "ArrowDown") $("nav-down").click();
   else if (e.key === "ArrowUp") $("nav-up").click();
