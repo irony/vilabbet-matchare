@@ -3,8 +3,35 @@ import type { JobState } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { dlUrl } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { dlUrl, redigerUrl } from "@/lib/api";
+
+type DokKind = "excel" | "ansokan" | "granskning";
+
+function DokCard({
+  jobId, dnr, ikon, titel, sub, kind, dlNamn, extra,
+}: {
+  jobId: string; dnr: string; ikon: string; titel: string; sub: string;
+  kind: DokKind; dlNamn: string; extra?: React.ReactNode;
+}) {
+  return (
+    <Card className="flex h-full flex-col justify-between p-4">
+      <div>
+        <div className="text-[15px] font-semibold text-[color:var(--color-ink)]">{ikon} {titel}</div>
+        <div className="mt-1 text-[12.5px] text-[color:var(--color-muted)]">{sub}</div>
+      </div>
+      <div className="mt-3 flex flex-col gap-1.5">
+        <Button
+          size="sm"
+          onClick={() => window.open(redigerUrl(jobId, kind, dnr), "_blank", "noopener")}
+        >Öppna i Eurooffice ↗</Button>
+        <a href={dlUrl(jobId, kind, dnr)} download={dlNamn} className="no-underline">
+          <Button size="sm" variant="outline" className="w-full">⤓ Ladda ner</Button>
+        </a>
+        {extra}
+      </div>
+    </Card>
+  );
+}
 
 export default function ResultScreen({
   job, jobId, onFeedback, onRestart,
@@ -35,29 +62,27 @@ export default function ResultScreen({
               </div>
             )}
             <div className="mt-3 grid gap-3 md:grid-cols-3">
-              <a href={dlUrl(jobId, "excel", a.dnr)} download={a.filnamn_xlsx} className="no-underline">
-                <Card className="h-full cursor-pointer p-4 transition hover:border-[color:var(--color-accent)]">
-                  <div className="text-[15px] font-semibold text-[color:var(--color-ink)]">📊 Kravmatris (Excel)</div>
-                  <div className="mt-1 text-[12.5px] text-[color:var(--color-muted)]">{a.dnr} — bevisstatus per krav</div>
-                </Card>
-              </a>
-              <Card className={cn("flex h-full flex-col justify-between p-4 transition hover:border-[color:var(--color-accent)]",
-                visaMd === a.dnr && "border-[color:var(--color-accent)]")}>
-                <a href={dlUrl(jobId, "ansokan", a.dnr)} download={a.filnamn_md} className="no-underline">
-                  <div className="text-[15px] font-semibold text-[color:var(--color-ink)]">📝 Ansökningshandling</div>
-                  <div className="mt-1 text-[12.5px] text-[color:var(--color-muted)]">utkast som .md — klicka för att ladda ner</div>
-                </a>
-                <button
-                  onClick={() => setVisaMd(visaMd === a.dnr ? null : a.dnr)}
-                  className="mt-2 self-start text-[12px] font-medium text-[color:var(--color-accent)] underline-offset-2 hover:underline"
-                >{visaMd === a.dnr ? "Dölj utkastet" : "Visa utkastet i sidan"}</button>
-              </Card>
-              <a href={dlUrl(jobId, "granskning", a.dnr)} download={`granskning_${job.company}_${a.dnr}.xlsx`} className="no-underline">
-                <Card className="h-full cursor-pointer p-4 transition hover:border-[color:var(--color-accent)]">
-                  <div className="text-[15px] font-semibold text-[color:var(--color-ink)]">🔍 Granskning (Excel)</div>
-                  <div className="mt-1 text-[12.5px] text-[color:var(--color-muted)]">ifyllbart granskningsformulär</div>
-                </Card>
-              </a>
+              <DokCard
+                jobId={jobId} dnr={a.dnr} kind="excel" ikon="📊"
+                titel="Kravmatris (Excel)" sub={`${a.dnr} — bevisstatus per krav`}
+                dlNamn={a.filnamn_xlsx}
+              />
+              <DokCard
+                jobId={jobId} dnr={a.dnr} kind="ansokan" ikon="📝"
+                titel="Ansökningshandling" sub="redigerbart utkast i Eurooffice"
+                dlNamn={a.filnamn_md}
+                extra={
+                  <button
+                    onClick={() => setVisaMd(visaMd === a.dnr ? null : a.dnr)}
+                    className="self-start text-[12px] font-medium text-[color:var(--color-accent)] underline-offset-2 hover:underline"
+                  >{visaMd === a.dnr ? "Dölj utkastet i sidan" : "Visa utkastet i sidan"}</button>
+                }
+              />
+              <DokCard
+                jobId={jobId} dnr={a.dnr} kind="granskning" ikon="🔍"
+                titel="Granskning (Excel)" sub="ifyllbart granskningsformulär"
+                dlNamn={`granskning_${job.company}_${a.dnr}.xlsx`}
+              />
             </div>
             {visaMd === a.dnr && (
               <Card className="mt-3 max-h-[70vh] overflow-y-auto p-6">

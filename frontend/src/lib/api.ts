@@ -195,6 +195,10 @@ export const Api = {
     }),
 };
 
+export function redigerUrl(jobId: string, kind: "excel" | "ansokan" | "granskning", dnr: string) {
+  return `/r/${jobId}/${kind}/${dnr}`;
+}
+
 export function dlUrl(jobId: string, kind: "excel" | "ansokan" | "granskning", dnr: string) {
   const ext = kind === "ansokan" ? "md" : "xlsx";
   return `/api/download/${jobId}/${kind}/${dnr}.${ext}`;

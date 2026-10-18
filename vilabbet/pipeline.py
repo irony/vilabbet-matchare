@@ -35,7 +35,8 @@ PHASES = ("startad", "skrapar", "matchar", "valet", "hamtar_krav", "kravsum",
 
 # fält i job-state som inte exponeras publikt (interna rådata/binärer)
 PRIVATE_KEYS = ("log", "_company_data", "_bolagsfakta", "_kravobj",
-                "_results_full", "_excel", "_granskning_xlsx", "_email")
+                "_results_full", "_excel", "_granskning_xlsx", "_email",
+                "_doc_versions", "_ansokan_docx")
 
 
 def new_job_state():

@@ -74,6 +74,28 @@ registret — visar "Vi tror det är **X AB** (org.nr). Är det här bolaget?" m
 Ja/alternativ/Nej. Privata domäner (gmail m.fl.) faller tillbaka på att fråga
 om webbadress. Mejlen sparas privat i jobbet och används för resultatmailet.
 
+### Redigera i Eurooffice (OnlyOffice-flöde)
+
+Resultatskärmens dokument-kort har klicka "✒ Öppna i Eurooffice ↗" — servern
+renderar en OnlyOffice integrationsida (`/r/{jobb}/{excel|ansokan|granskning}/{dnr}`)
+som låter `eurooffice.berget.ai` (samma API som ONLYOFFICE Docs) dra filen
+från `/r-file/…` och spara tillbaka via `/r-save/…` (callbackUrl). Ansökan
+(.md) konverteras till .docx on-the-fly (`python-docx` — lägg med i run-raden).
+Redigeringar landar i job-state och därmed i nedladdningslänkarna direkt.
+
+Nyttiga env-variabler:
+
+- `PUBLIC_BASE` — måste nås från eurooffice-servern (i produktion: publikt
+  dns-namn; vid lokala live-demos: en tunnel-URL, t.ex. cloudflared quick
+  tunnel). Default `http://localhost:8377` (redigeraren ramlar vidare men
+  dokumentservern kan ej dra filen).
+- `EUROOFFICE_HOST` — default `https://eurooffice.berget.ai`
+- `EUROOFFICE_JWT_SECRET` — om OnlyOffice-instansen kräver JWT på configens
+  kontraktsområde, sätt den samma hemligheten här (HS256 signeras automatiskt)
+
+Körservern: `--with python-docx` till i uv-kommandot (för ansökan),
+`--host 0.0.0.0` om den ska nås utifrån.
+
 ### Resultatmail
 
 När jobbet landar i `klar` och mejl angivits går ut ett mail med
