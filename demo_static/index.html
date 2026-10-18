@@ -298,6 +298,11 @@
     korpusets alla ansökningsomgångar — bara de som ligger framåt i tiden.</p>
   <input type="text" id="inp-url" placeholder="t.ex. dittbolag.se" autofocus
          enterkeyhint="go">
+  <div id="gissa-banner" style="display:none; margin-top:16px; max-width:min(560px,85vw);
+    background:var(--accent-soft); border:1.5px solid var(--accent); border-radius:12px;
+    padding:14px 18px; font-size:14.5px"></div>
+  <div id="gissa-spinner" style="display:none; margin-top:12px; font-size:13px;
+    color:var(--muted)">⏳ Kollar upp vilket bolag som hör till domänen …</div>
   <div id="org-wrap" style="position:relative; width:min(420px,80vw); margin-top:18px">
     <input type="text" id="inp-orgnr" placeholder="bolagsnamn eller org.nr 556xxx-xxxx (autocomplete)"
            style="font-size:16px; border-bottom-width:2px; width:100%">
@@ -627,6 +632,56 @@ $("inp-orgnr").addEventListener("input", e => {
 document.addEventListener("click", e => {
   if (!document.getElementById("org-wrap").contains(e.target))
     $("org-suggest").style.display = "none";
+});
+
+// ---- domän → bolagsgissning → föreslå orgnr före submit
+let gissaTimer = null;
+$("inp-url").addEventListener("input", e => {
+  clearTimeout(gissaTimer);
+  const u = e.target.value.trim();
+  if (!u.includes(".") || u.length < 4) return;
+  gissaTimer = setTimeout(async () => {
+    const sp = $("gissa-spinner"); sp.style.display = "block";
+    try {
+      const g = await api("/api/gissa_bolag", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: u }) });
+      sp.style.display = "none";
+      const träffar = g["träffar"] || [];
+      if (!träffar.length) return;
+      const b = $("gissa-banner");
+      b.innerHTML = `Vi tror det är <b>${träffar[0].namn}</b>
+        <span style="color:var(--muted)">(${träffar[0].orgnr})</span>.
+        Är det här bolaget?
+        <span style="margin-left:12px"></span>
+        <button class="btn" style="padding:6px 16px; font-size:13px" id="gissa-ja">Ja, bekräfta</button>
+        <button class="btn ghost" style="padding:6px 12px; font-size:13px" id="gissa-nej">Nej</button>` +
+        (träffar.length > 1 ?
+          `<div style="font-size:12.5px; color:var(--muted); margin-top:6px">
+            andra träffar: ${träffar.slice(1).map(t =>
+              `<span class="gissa-alt" data-org="${t.orgnr}" data-namn="${t.namn}"
+                style="cursor:pointer; color:var(--accent); border-bottom:1px solid var(--accent)"
+               >${t.namn} (${t.orgnr})</span>`).join(", ")}</div>` : "");
+      b.style.display = "block";
+      $("gissa-ja").onclick = () => {
+        $("inp-orgnr").value = träffar[0].orgnr;
+        const cf = $("org-confirm");
+        cf.textContent = `⚖️ ${träffar[0].namn} — bekräftat från Bolagsverkets register`;
+        cf.style.display = "block";
+        b.style.display = "none";
+      };
+      $("gissa-nej").onclick = () => { b.style.display = "none"; };
+      b.querySelectorAll(".gissa-alt").forEach(el => {
+        el.onclick = () => {
+          $("inp-orgnr").value = el.dataset.org;
+          const cf = $("org-confirm");
+          cf.textContent = `⚖️ ${el.dataset.namn} — bekräftat från Bolagsverkets register`;
+          cf.style.display = "block";
+          b.style.display = "none";
+        };
+      });
+    } catch (e2) { sp.style.display = "none"; }
+  }, 900);
 });
 
 // ---- steg 1: starta

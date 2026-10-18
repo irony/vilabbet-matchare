@@ -8,3 +8,5 @@ output/
 profiler/
 *_profil.txt
 *.sqlite
+frontend/node_modules/
+frontend/dist/

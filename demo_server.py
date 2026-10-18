@@ -1,24 +1,33 @@
-"""Demo-server: Typeform-flöde för utlysningsmatchning.
+"""Demo-server: tunn FastAPI-oöskörning över vilabbet-paketet.
 
-Kör:  set -a; source sandbox.env; set +a; export BERGET_API_KEY=...
-      uv run --with fastapi --with uvicorn uvicorn demo_server:app --port 8377
+Kör:  set -a; source sandbox.env; set +a
+      uv run --with fastapi --with uvicorn --with openpyxl \\
+        uvicorn demo_server:app --port 8377
 
-Flöde: POST /api/start -> job {id, phase}
-       GET  /api/job/{id} -> status + data
-       POST /api/select -> factfinding + dokument
-       GET  /api/download/{job_id}/{doc}.md
+Flöde: POST /api/start → job {id, phase}
+       GET  /api/job/{id} → state + data (pollar)
+       POST /api/select → väljer upp till 3 omgångar
+       POST /api/analysera → bevissökning
+       POST /api/fortsatt → dokument + granskning
+       GET  /api/download/{job_id}/excel|ansokan|granskning
+        GET  /api/bolag?q= → autocomplete (Bolagsverkets register)
+        POST /api/gissa_bolag → domän → skrapa 1 sida → namn → registerträffar
 """
 import os
+import re
+import sys
 import threading
 import traceback
-import uuid
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import demo_core
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import demo_core  # noqa: E402
+from vilabbet import PipelineJob  # noqa: E402
+from vilabbet.pipeline import new_job_state, public_view  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -41,210 +50,32 @@ class JobIn(BaseModel):
     job_id: str
 
 
-def new_job():
-    jid = uuid.uuid4().hex[:10]
-    JOBS[jid] = {"phase": "startad", "log": [], "items": [],
-                 "done": False, "error": None}
-    return jid, JOBS[jid]
+class FeedbackIn(BaseModel):
+    job_id: str
+    dnrs: dict          # dnr -> {"punkter": {nr: {...}}, "kommentar": str}
 
 
-def logger(job):
-    def emit(msg):
-        (job["items"] if isinstance(msg, dict) else job["log"]).append(msg)
-        if len(job["items"]) > 400:
-            del job["items"][:-400]
-    return emit
+def _run_in_thread(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
 
 
-def job_public(job):
-    return {k: v for k, v in job.items()
-            if k not in ("log", "_company_data", "_bolagsfakta",
-                         "_kravobj", "_results_full", "_excel",
-                         "_granskning_xlsx")} | {
-        "step": job["log"][-1] if job["log"] else job["phase"],
-        "log": job["log"][-8:],
-        "items": job["items"],
-    }
-
-
-def run_match(jid, job, url, orgnr):
-    try:
-        job["phase"] = "skrapar"
-        data = demo_core.scrape_company(url, progress=logger(job))
-        job["company"] = data["company"]
-        job["profil"] = data["profil"]
-        job["_company_data"] = data
-
-        bf = demo_core.bolagsfakta_from_sites(data, orgnr=orgnr,
-                                              progress=logger(job))
-        job["_bolagsfakta"] = bf
-        job["orgnr"] = (bf or {}).get("orgnr")
-        p = ((bf or {}).get("party") or {})
-        reg = (bf or {}).get("registret") or {}
-        job["nyckelfakta"] = {
-            "orgnr": job.get("orgnr"),
-            "namn": p.get("name"),
-            "grundat": p.get("founded"),
-            "antal_anstallda": p.get("employees"),
-            "omsattning_tkr": p.get("turnover_ksek"),
-            "balans_tkr": p.get("balance_sheet_total_ksek"),
-            "ort": reg.get("ort") or p.get("ort"),
-            "form": reg.get("form"),
-            "likvidation": reg.get("likvidation_eller_rekonstruktion"),
-            "kalla": (bf or {}).get("kalla"),
-            "register_driven": bool(reg),
-        }
-
-        job["phase"] = "matchar"
-        matches = demo_core.match_rounds(data["profil"], max_results=15,
-                                         progress=logger(job))
-        job["matches"] = matches
-        job["phase"] = "valet"          # väntar på användarens val
-    except Exception as e:  # noqa: BLE001
-        job["error"] = str(e)
-        job["phase"] = "fel"
-        traceback.print_exc()
-    finally:
-        job["done"] = True
-
-
-def run_kravsum(jid, job, dnrs):
-    """Fas 1 efter val: hämta de identifierade kraven (ingen LLM-analys)."""
-    job["done"] = False
-    try:
-        job["phase"] = "hamtar_krav"
-        kravobj = []
-        for i, dnr in enumerate(dnrs, 1):
-            job["log"].append(f"Hämtar krav {i}/{len(dnrs)}: {dnr}")
-            ko = demo_core.hämta_kravobj(dnr, progress=logger(job))
-            if job.get("matches"):
-                m = next((m for m in job["matches"] if m["dnr"] == dnr), None)
-                ko["varfor"] = (m or {}).get("varfor", "")
-                ko["similarity"] = (m or {}).get("matchpoang", 0) / 100 if m else 0
-            kravobj.append(ko)
-        job["_kravobj"] = kravobj
-        job["kravsum"] = [{
-            "dnr": k["dnr"], "title": k["title"],
-            "closing_date": k["closing_date"], "state": k["state"],
-            "funder": k["funder"], "similarity": k.get("similarity", 0),
-            "varfor": k.get("varfor", ""),
-            "n_krav_totalt": k["n_krav_totalt"],
-            "n_relevanta": len(k["krav_objekt"]),
-            "krav_preview": [{"type": r["type"], "text": r["text"]}
-                             for r in k["krav_objekt"][:8]],
-            "krav_full": [{"id": r["requirement_id"], "type": r.get("type"),
-                           "text": demo_core._korta(r.get("text"), 160)}
-                          for r in k["krav_objekt"]],
-        } for k in kravobj]
-        job["log"].append("Grupperar snarlika krav ämnessvis …")
-        grupper = demo_core.gruppera_krav(kravobj)
-        job["grupper"] = grupper
-        job["log"].append(
-            f"{sum(len(g['forekomster']) for g in grupper)} krav → "
-            f"{len(grupper)} unika grupper")
-        job["phase"] = "kravsum"
-    except Exception as e:  # noqa: BLE001
-        job["error"] = str(e)
-        job["phase"] = "fel"
-        traceback.print_exc()
-    finally:
-        job["done"] = True
-
-
-def run_facts(jid, job):
-    """Fas 2: bevissökning i den skrapade textmassan (LLM)."""
-    job["done"] = False
-    try:
-        job["phase"] = "analyserar"
-        results = []
-        kravobj = job["_kravobj"]
-        for i, ko in enumerate(kravobj, 1):
-            job["log"].append(f"Omgång {i}/{len(kravobj)}: {ko['dnr']}")
-            res = demo_core.analysera(job["_company_data"], job.get("_bolagsfakta"),
-                                      ko["dnr"], progress=logger(job),
-                                      prefetched=ko)
-            results.append(res)
-        job["results"] = [
-            {k: v for k, v in r.items() if k != "krav"}
-            | {"krav_sample": r["krav"][:200]} for r in results]
-        job["_results_full"] = results
-        job["phase"] = "bevissum"
-    except Exception as e:  # noqa: BLE001
-        job["error"] = str(e)
-        job["phase"] = "fel"
-        traceback.print_exc()
-    finally:
-        job["done"] = True
-
-
-def run_docs(jid, job):
-    """Fas 3: per ansökan — kravmatris (Excel) + ansökningshandling (md)."""
-    job["done"] = False
-    log = logger(job)
-    try:
-        job["phase"] = "dokumenterar"
-        results = job["_results_full"]
-        company = job["company"]
-        job["_excel"] = {}
-        job["docs"] = {"ansokningar": []}
-        for res in results:
-            dnr = res["dnr"]
-            log(f"Bygger kravmatris (Excel) — {dnr}")
-            job["_excel"][dnr] = demo_core.build_kravmatris_xlsx(res, company)
-            log({"kind": "doc_done", "dnr": dnr, "doc": "excel",
-                 "title": f"📊 Kravmatris {dnr}",
-                 "sub": f"{len(res['krav'])} kravrader klara"})
-            log(f"Skriver ansökningshandling — {dnr}")
-            md = demo_core.build_application_doc(job["_company_data"], res,
-                                                 progress=log)
-            job["docs"]["ansokningar"].append({
-                "dnr": dnr, "title": res["title"],
-                "filnamn_md": f"ansokan_{company}_{dnr}.md",
-                "filnamn_xlsx": f"kravmatris_{company}_{dnr}.xlsx",
-                "md": md,
-            })
-            log({"kind": "doc_done", "dnr": dnr, "doc": "ansokan",
-                 "title": f"📝 Ansökningshandling {dnr}",
-                 "sub": "utkast för mänsklig granskning"})
-        # --- fas 4: färska-ögon-granskning, bolagsblind ---
-        job["phase"] = "granskar"
-        job["granskning"] = {}
-        job["_granskning_xlsx"] = {}
-        for res in results:
-            dnr = res["dnr"]
-            md = next((a["md"] for a in job["docs"]["ansokningar"]
-                       if a["dnr"] == dnr), "")
-            try:
-                g = demo_core.granska_ansokan(res, md, progress=log)
-            except Exception as e:  # noqa: BLE001
-                g = {"sammanfattning": f"Granskningen misslyckades: {e}",
-                     "punkter": [], "antal": {}}
-            g["filnamn_xlsx"] = f"granskning_{company}_{dnr}.xlsx"
-            job["granskning"][dnr] = g
-            job["_granskning_xlsx"][dnr] = demo_core.bygg_gransknings_xlsx(
-                res, g, company)
-            log({"kind": "doc_done", "dnr": dnr, "doc": "granskning",
-                 "title": f"🔍 Granskning {dnr}",
-                 "sub": f"{len(g['punkter'])} punkter — "
-                        f"{(g.get('antal') or {}).get('blockerare', 0)} blockerare"})
-        job["phase"] = "klar"
-    except Exception as e:  # noqa: BLE001
-        job["error"] = str(e)
-        job["phase"] = "fel"
-        traceback.print_exc()
-    finally:
-        job["done"] = True
+def _job_or_404(inp: JobIn):
+    job = JOBS.get(inp.job_id)
+    if not job:
+        raise HTTPException(404, "okänt jobb")
+    return job
 
 
 @app.post("/api/start")
 def start(inp: StartIn):
     if not inp.url.startswith(("http://", "https://")):
         inp.url = "https://" + inp.url
-    jid, job = new_job()
+    jid, job = new_job_state()
+    JOBS[jid] = job
     job["phase"] = "skrapar"
-    threading.Thread(target=run_match, args=(jid, job, inp.url, inp.orgnr),
-                     daemon=True).start()
-    return {"job_id": jid}
+    pj = PipelineJob(job)
+    _run_in_thread(pj.börja, inp.url, inp.orgnr)
+    return {"job_id": jid, "phase": "skrapar"}
 
 
 @app.get("/api/bolag")
@@ -257,51 +88,118 @@ def bolag_search(q: str = ""):
         return {"träffar": [], "varning": f"register ej tillgängligt: {e}"}
 
 
+class GissaIn(BaseModel):
+    url: str
+
+
+def _rensa_gissning(s: str) -> str:
+    """Title/h1 till sårent bolagssök-ord: första segmentet före | – — : ;"""
+    s = re.split(r"[|–—:;·•]", s)[0].strip()
+    return re.sub(r"\s+\(?Konsult(ing)?\)?$", "", s, flags=re.I).strip()
+
+
+@app.post("/api/gissa_bolag")
+def gissa_bolag(inp: GissaIn):
+    """Domän → skrapa 1 sida → bolagsnamn-gissning → registersök.
+
+    Används av startskärmen för att föreslå orgnr direkt: användaren skriver
+    in webbadressen, vi skrapar förstasidan (og:site_name/title/h1/domän),
+    letar i Bolagsverkt-registret, och returnerar upp till 3 träffar att
+    bekräfta eller pröva själva.
+    """
+    import foretagsregister
+    url = inp.url if inp.url.startswith(("http://", "https://")) else "https://" + inp.url
+    md, meta = "", {}
+    try:
+        r = demo_core._fc("scrape", {"url": url, "formats": ["markdown"],
+                                     "onlyMainContent": True})
+        d = r.get("data") or {}
+        md = d.get("markdown") or ""
+        meta = d.get("metadata") or {}
+    except Exception:  # noqa: BLE001
+        md, meta = "", {}
+
+    kandidater: list[str] = []
+    for nyckel in ("og:site_name", "ogSiteName", "title"):
+        v = meta.get(nyckel)
+        if v:
+            kandidater.append(str(v))
+    h1 = re.search(r"^#\s+(.+?)\s*$", md, re.M)
+    if h1:
+        kandidater.append(h1.group(1))
+    # domän-prefix som sista utväg
+    dom = re.sub(r"https?://(www\.)?", "", url).split("/")[0]
+    if dom:
+        kandidater.append(dom.split(".")[0])
+
+    def sok(namn: str):
+        t = foretagsregister.search(namn, limit=3)
+        if not t and " " in namn:
+            t = foretagsregister.search(namn.split()[0], limit=3)
+        return t
+
+    for kand in kandidater:
+        namn = _rensa_gissning(kand)
+        if len(namn) >= 2:
+            träffar = sok(namn)
+            if träffar:
+                return {"namn_gissning": namn, "träffar": träffar,
+                        "url": url}
+    namn = _rensa_gissning(kandidater[0]) if kandidater else None
+    return {"namn_gissning": namn, "träffar": [], "url": url}
+
+
 @app.get("/api/job/{jid}")
 def get_job(jid: str):
     job = JOBS.get(jid)
     if not job:
         raise HTTPException(404, "okänt jobb")
-    return job_public(job)
+    return public_view(job)
 
 
 @app.post("/api/select")
 def select(inp: SelectIn):
-    job = JOBS.get(inp.job_id)
-    if not job:
-        raise HTTPException(404, "okänt jobb")
+    job = _job_or_404(inp)
     if job["phase"] not in ("valet", "kravsum", "bevissum"):
         raise HTTPException(409, f"jobbet är i fas '{job['phase']}'")
     if not inp.dnrs:
         raise HTTPException(400, "välj minst en omgång")
     inp.dnrs = inp.dnrs[:3]  # håll demon snabbt
-    threading.Thread(target=run_kravsum, args=(inp.job_id, job, inp.dnrs),
-                     daemon=True).start()
+    _run_in_thread(PipelineJob(job).välj, inp.dnrs)
     return {"ok": True, "antal": len(inp.dnrs)}
 
 
 @app.post("/api/analysera")
 def analysera(inp: JobIn):
-    job = JOBS.get(inp.job_id)
-    if not job:
-        raise HTTPException(404, "okänt jobb")
+    job = _job_or_404(inp)
     if job["phase"] != "kravsum":
         raise HTTPException(409, f"jobbet är i fas '{job['phase']}'")
-    threading.Thread(target=run_facts, args=(inp.job_id, job),
-                     daemon=True).start()
+    _run_in_thread(PipelineJob(job).analysera)
     return {"ok": True}
 
 
 @app.post("/api/fortsatt")
 def fortsatt(inp: JobIn):
+    job = _job_or_404(inp)
+    if job["phase"] != "bevissum":
+        raise HTTPException(409, f"jobbet är i fas '{job['phase']}'")
+    _run_in_thread(PipelineJob(job).fortsätt)
+    return {"ok": True}
+
+
+@app.post("/api/feedback")
+def feedback(inp: FeedbackIn):
+    """Sparar det ifyllda granskningsformuläret (per ansökan)."""
     job = JOBS.get(inp.job_id)
     if not job:
         raise HTTPException(404, "okänt jobb")
-    if job["phase"] != "bevissum":
-        raise HTTPException(409, f"jobbet är i fas '{job['phase']}'")
-    threading.Thread(target=run_docs, args=(inp.job_id, job),
-                     daemon=True).start()
-    return {"ok": True}
+    job.setdefault("feedback", {})
+    n = 0
+    for dnr, data in inp.dnrs.items():
+        job["feedback"][dnr] = data
+        n += len((data.get("punkter") or {}) if isinstance(data, dict) else {})
+    job["log"].append(f"Granskningsformulär sparat — {n} svar ifyllda")
+    return {"ok": True, "svar": n}
 
 
 @app.get("/api/download/{jid}/excel/{dnr}.xlsx")
@@ -331,7 +229,7 @@ def dl_ansokan(jid: str, dnr: str):
 
 @app.get("/api/download/{jid}/granskning/{dnr}.xlsx")
 def dl_granskning(jid: str, dnr: str):
-    """Granskningsformuläret som Excel; återfyllt om formuläret sparats."""
+    """Granskningsformuläret som Excel; återifyllt om formuläret sparats."""
     job = JOBS.get(jid)
     g = (job or {}).get("granskning", {}).get(dnr)
     res = next((r for r in (job or {}).get("_results_full", [])
@@ -354,25 +252,11 @@ def dl_granskning(jid: str, dnr: str):
                  f'attachment; filename="granskning_{job["company"]}_{dnr}.xlsx"'})
 
 
-class FeedbackIn(BaseModel):
-    job_id: str
-    dnrs: dict          # dnr -> {"punkter": {nr: {...}}, "kommentar": str}
-
-
-@app.post("/api/feedback")
-def feedback(inp: FeedbackIn):
-    """Sparar det ifyllda granskningsformuläret (per ansökan)."""
-    job = JOBS.get(inp.job_id)
-    if not job:
-        raise HTTPException(404, "okänt jobb")
-    job.setdefault("feedback", {})
-    n = 0
-    for dnr, data in inp.dnrs.items():
-        job["feedback"][dnr] = data
-        n += len((data.get("punkter") or {}) if isinstance(data, dict) else {})
-    job["log"].append(f"Granskningsformulär sparat — {n} svar ifyllda")
-    return {"ok": True, "svar": n}
-
+# React-app (byggd från frontend/, se README) — fallback: vanilla-demon
+_REACT_DIST = os.path.join(HERE, "frontend", "dist")
+if os.path.isdir(_REACT_DIST):
+    app.mount("/app", StaticFiles(directory=_REACT_DIST, html=True),
+              name="react-app")
 
 app.mount("/", StaticFiles(directory=os.path.join(HERE, "demo_static"),
                            html=True), name="static")
