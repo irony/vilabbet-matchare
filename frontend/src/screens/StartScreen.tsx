@@ -120,12 +120,21 @@ export default function StartScreen({
         Vinnova-matcharen
       </p>
       <h1 className="mt-3 text-[clamp(30px,5vw,44px)] leading-[1.1]">
-        Hej! Din arbetsmail räcker — resten kollar vi upp själva
+        Vi skriver er ansökan om innovationsstöd — automatiskt
       </h1>
       <p className="mt-4 max-w-[640px] text-[16.5px] leading-relaxed text-[color:var(--color-muted)]">
-        Domänen i din mejl berättar vilket bolag du jobbar på. Vi skrapar sidan,
-        bygger en profil och matchar mot korpusens ansökningsomgångar — medan du läser.
+        Åtminstone ett ordentligt utkast. Ni skriver in din arbetsmail — så hittar vi
+        bolaget, matchar det mot alla 303 öppna utlysningar från Vinnova, Formas m.fl.,
+        kollar varje krav mot er webbplats och tar fram kravmatris, ansökningsutkast
+        och en granskning med färska ögon. Ni granskar, kompletterar — och skickar in.
       </p>
+      <div className="mt-5 flex flex-wrap gap-2">
+        {["1 · Hitta rätt utlysning", "2 · Beviskolla kraven", "3 · Klart utkast + granskning"].map((s) => (
+          <span key={s} className="rounded-full border border-[color:var(--color-line)] bg-white px-3.5 py-1.5 text-[13px] text-[color:var(--color-muted)]">
+            {s}
+          </span>
+        ))}
+      </div>
       <div className="mt-8 flex flex-col gap-4">
         {mode === "email" && (
           <Input
