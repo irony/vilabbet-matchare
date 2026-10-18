@@ -1,7 +1,7 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import {
-  Background, Controls, Handle, Position, ReactFlow,
-  type Edge, type Node, type NodeProps,
+  Background, Controls, Handle, Position, ReactFlow, ReactFlowProvider,
+  useReactFlow, type Edge, type Node, type NodeProps,
 } from "@xyflow/react";
 import type { JobState } from "@/lib/api";
 
@@ -54,15 +54,46 @@ function VfNodeView({ data }: NodeProps<VfNode>) {
   );
 }
 
-const NODE_TYPES = { vf: VfNodeView };
+/** Bakgrunds-band ("grind") per fas: streckad kolumn bakom noderna. */
+type BandData = { titel: string; status: "väntar" | "aktiv" | "klar"; bredd: number; höjd: number };
+type BandNode = Node<BandData, "band">;
+
+function BandNodeView({ data }: NodeProps<BandNode>) {
+  return (
+    <div
+      style={{
+        width: data.bredd, height: data.höjd,
+        border: `2px dashed ${data.status === "aktiv" ? "var(--color-accent)" : "#cdd8e4"}`,
+        borderRadius: 18,
+        background: data.status === "aktiv"
+          ? "color-mix(in srgb, var(--color-accent) 5%, transparent)"
+          : data.status === "klar" ? "rgba(244, 248, 251, .55)" : "transparent",
+        padding: 14, pointerEvents: "none",
+      }}
+    >
+      <div style={{
+        fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em",
+        color: data.status === "aktiv" ? "var(--color-accent)" : "var(--color-muted)",
+      }}>
+        {data.status === "klar" ? "✓ " : data.status === "aktiv" ? "▶ " : ""}{data.titel}
+      </div>
+    </div>
+  );
+}
+
+const NODE_TYPES = { vf: VfNodeView, band: BandNodeView };
 
 function buildFlow(job: JobState) {
   const items = job.items ?? [];
   const aktivLane: Lane = FAS_TILL_LANE[job.phase] ?? "domän";
   const noder: VfNode[] = [];
   const kanter: Edge[] = [];
-  let föregående: string | null = null;
   const laneRäkne = new Map<Lane, number>();
+  // ryggbens-modell: en enda kant per filövergång (sista noden i förra
+  // filen → första noden i nästa). Inom filen staplas noder kantfritt —
+  // rent och läsbart även när parallella processer fyller på.
+  const laneOrdn = Object.keys(KOLUMNER) as Lane[];
+  const sistaIFil: Partial<Record<Lane, string>> = {};
 
   const lägg = (
     lane: Lane, id: string, label: string, sub: string | undefined,
@@ -86,17 +117,25 @@ function buildFlow(job: JobState) {
           ? "0 0 0 3px rgba(74, 111, 165, .18)" : "0 2px 10px rgba(20, 30, 50, .05)",
       },
     });
-    if (föregående) {
-      kanter.push({
-        id: `${föregående}→${id}`, source: föregående, target: id,
-        animated: lane === aktivLane,
-        style: {
-          stroke: lane === aktivLane ? "var(--color-accent)" : "#b9c6d6",
-          strokeWidth: lane === aktivLane ? 2 : 1.4,
-        },
-      });
+    if (i === 0) {
+      // första noden i filen → ryggbens-kant från närmaste befolkade fil bakåt
+      const idx = laneOrdn.indexOf(lane);
+      for (let j = idx - 1; j >= 0; j--) {
+        const ofor = sistaIFil[laneOrdn[j]];
+        if (ofor) {
+          kanter.push({
+            id: `${ofor}→${id}`, source: ofor, target: id,
+            animated: lane === aktivLane,
+            style: {
+              stroke: lane === aktivLane ? "var(--color-accent)" : "#b9c6d6",
+              strokeWidth: lane === aktivLane ? 2 : 1.4,
+            },
+          });
+          break;
+        }
+      }
     }
-    föregående = id;
+    sistaIFil[lane] = id;
   };
 
   // 1. Domän
@@ -150,21 +189,51 @@ function buildFlow(job: JobState) {
     lägg("krav", "krav-väntar", "hämtar kraven …", undefined,
          { ghost: true, aktiv: aktivLane === "krav" });
 
-  // 7. Beslutsprocesser — en beslutsknut per krav, färg per verdict
-  const reqs = items.filter(i => i.kind === "req");
+  // 7. Beslutsprocesser — varje krav börjar som öppen fråga (spöknod)
+  //    och morfar om till färgkodat svar när verdicten strömmar in.
+  //    Samma node-id ⇒ mjuk övergång. Källa pending: job.kravsum[].krav_full
+  const kravFull = (job.kravsum ?? []).flatMap((k) =>
+    (k.krav_full ?? []).map((r, i) => ({ ...r, dnr: k.dnr, n: i + 1 })));
+  // verdict-meddelanden har ordinal n (position i omgångens kravlista) —
+  // robust mot att LLM:ets echo ibland hämtar annonserade id-strängar
+  const svarMap = new Map(
+    items.filter((i) => i.kind === "req" && typeof i.n === "number")
+         .map((i) => [`${i.dnr}|${i.n}`, i]));
   const ikon: Record<string, string> = {
     styrkt_uppfyllt: "✅", okant: "❓", styrkt_ej_uppfyllt: "❌", strukturellt: "🔧",
   };
-  reqs.slice(0, 14).forEach((r, i) =>
-    lägg("bevis", `req-${i}`, `${ikon[r.status ?? ""] ?? "▸"} ${(r.title ?? "").slice(0, 46)}`,
-         (r.sub ?? "").slice(0, 70),
-         { färg: STATUS_FÄRG[r.status ?? ""] ?? "#95a5a6", klar: true,
-           aktiv: aktivLane === "bevis" && i === Math.min(reqs.length, 14) - 1 }));
-  if (reqs.length > 14)
-    lägg("bevis", "req-över", `+ ${reqs.length - 14} krav prövade till`, undefined, { ghost: true, klar: true });
-  if (!reqs.length)
+  const VISIBLA = 12;
+  const slots = kravFull.slice(0, VISIBLA);
+  const senastBesvaradeIdx = (() => {
+    let b = -1;
+    slots.forEach((k, i) => { if (svarMap.has(`${k.dnr}|${k.n}`)) b = i; });
+    return b;
+  })();
+  slots.forEach((k, i) => {
+    const s = svarMap.get(`${k.dnr}|${k.n}`);
+    if (s) {
+      lägg("bevis", `bevis-${i}`,
+           `${ikon[s.status ?? ""] ?? "▸"} ${(k.text ?? "").slice(0, 46)}`,
+           (s.sub ?? "").slice(0, 70),
+           { färg: STATUS_FÄRG[s.status ?? ""] ?? "#95a5a6", klar: true,
+             aktiv: aktivLane === "bevis" && i === senastBesvaradeIdx });
+    } else {
+      lägg("bevis", `bevis-${i}`,
+           `💭 ${(k.text ?? "").slice(0, 46)}`,
+           "letar bevis …",
+           { ghost: true, aktiv: aktivLane === "bevis" });
+    }
+  });
+  if (!slots.length)
     lägg("bevis", "req-väntar", "källkopplad faktasök per krav …", undefined,
          { ghost: true, aktiv: aktivLane === "bevis" });
+  const besvarade = svarMap.size;
+  const totalt = kravFull.length;
+  lägg("bevis", "bevis-räknare",
+       totalt ? `🧮 ${besvarade} av ${totalt} besvarade` : `${besvarade} besvarade`,
+       totalt > VISIBLA ? `visar de ${VISIBLA} första av ${totalt}` : undefined,
+       { ghost: totalt > 0 && besvarade < totalt,
+         klar: totalt > 0 && besvarade >= totalt });
 
   // 8. Bevissum-summering
   const res = job.results ?? [];
@@ -203,11 +272,55 @@ function buildFlow(job: JobState) {
        { klar: Boolean(job.mail_skickat), ghost: !job.mail_skickat,
          aktiv: aktivLane === "mail" && !job.mail_skickat });
 
-  return { noder, kanter, aktivLane };
+  // bakgrunds-band per fas — "grinden" som visar var i processen vi är
+  const bandNoder: BandNode[] = laneOrdn.map((lane) => {
+    const antal = laneRäkne.get(lane) ?? 0;
+    const höjd = Math.max(antal * 112 + 90, 260);
+    const idx = laneOrdn.indexOf(lane);
+    const aktIdx = laneOrdn.indexOf(aktivLane);
+    const status: BandData["status"] = idx < aktIdx ? "klar" : idx === aktIdx ? "aktiv" : "väntar";
+    return {
+      id: `band-${lane}`, type: "band" as const,
+      position: { x: KOLUMNER[lane] - 34, y: 0 },
+      draggable: false, selectable: false, focusable: false,
+      zIndex: -1,
+      data: { titel: LANE_TITEL[lane], status, bredd: 308, höjd },
+    };
+  });
+
+  return { noder: [...bandNoder, ...noder] as Node[], kanter, aktivLane, antalPerFil: Object.fromEntries(laneRäkne) };
 }
 
-export default function FlowScreen({ title, job }: { title: string; job: JobState }) {
+function FlowInner({ title, job }: { title: string; job: JobState }) {
   const { noder, kanter, aktivLane } = useMemo(() => buildFlow(job), [job]);
+  const { fitView, setCenter } = useReactFlow();
+  const förraFilen = useRef<string | null>(null);
+
+  // vid fasbyte: zooma mjukt till den aktiva grinden ("var är vi nu?")
+  useEffect(() => {
+    if (förraFilen.current === aktivLane) return;
+    förraFilen.current = aktivLane;
+    const x = KOLUMNER[aktivLane] + 120;
+    const t = setTimeout(() => {
+      setCenter(x, 380, { zoom: 0.92, duration: 750 });
+    }, 120);
+    return () => clearTimeout(t);
+  }, [aktivLane, setCenter]);
+
+  // en gång per nytt jobb: börja i översikt
+  const jobStart = useRef<string>("");
+  useEffect(() => {
+    const nyckel = [
+      job.items?.length ?? 0, job.phase,
+      (job.items ?? []).slice(0, 1).map(i => i.title).join(),
+    ].join(":");
+    if (jobStart.current && jobStart.current !== nyckel &&
+        (job.items?.length ?? 0) <= 2 && job.phase === "skrapar") {
+      fitView({ duration: 500, padding: 0.1, minZoom: 0.25 });
+    }
+    jobStart.current = nyckel;
+  }, [job, fitView]);
+
   return (
     <div className="flex min-h-full flex-col">
       <div className="flex items-center justify-between gap-4 border-b border-[color:var(--color-line)] bg-white/85 px-6 py-3 backdrop-blur">
@@ -235,7 +348,7 @@ export default function FlowScreen({ title, job }: { title: string; job: JobStat
           edges={kanter}
           nodeTypes={NODE_TYPES}
           fitView
-          fitViewOptions={{ padding: 0.08, minZoom: 0.3 }}
+          fitViewOptions={{ padding: 0.1, minZoom: 0.25 }}
           minZoom={0.25}
           maxZoom={1.4}
           elementsSelectable={false}
@@ -256,7 +369,19 @@ export default function FlowScreen({ title, job }: { title: string; job: JobStat
             {job.items?.filter((i) => i.kind === "page").length ?? 0} sidor
           </p>
         </div>
+        <button
+          onClick={() => fitView({ duration: 550, padding: 0.08, minZoom: 0.22 })}
+          className="absolute bottom-4 right-4 z-10 rounded-full border border-[color:var(--color-line)] bg-white/90 px-3.5 py-1.5 text-[12.5px] shadow-sm backdrop-blur hover:bg-white"
+        >⇱ översikt</button>
       </div>
     </div>
+  );
+}
+
+export default function FlowScreen(props: { title: string; job: JobState }) {
+  return (
+    <ReactFlowProvider>
+      <FlowInner {...props} />
+    </ReactFlowProvider>
   );
 }

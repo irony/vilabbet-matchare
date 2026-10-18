@@ -128,9 +128,10 @@ class PipelineJob:
         self.job["done"] = False
         try:
             self.job["phase"] = "hamtar_krav"
-            kravobj = []
-            for i, dnr in enumerate(dnrs, 1):
-                self.logg(f"Hämtar krav {i}/{len(dnrs)}: {dnr}")
+
+            def _hämta(pd):
+                i, dnr = pd
+                self.logg(f"Hämtar krav {i + 1}/{len(dnrs)}: {dnr}")
                 ko = demo_core.hämta_kravobj(dnr, progress=self.logg)
                 if self.job.get("matches"):
                     m = next((m for m in self.job["matches"]
@@ -138,7 +139,13 @@ class PipelineJob:
                     ko["varfor"] = (m or {}).get("varfor", "")
                     ko["similarity"] = (m or {}).get("matchpoang", 0) / 100 \
                         if m else 0
-                kravobj.append(ko)
+                return ko
+
+            from concurrent.futures import ThreadPoolExecutor
+            if len(dnrs) > 1:
+                self.logg(f"Hämtar {len(dnrs)} omgångar parallellt (3 trådar) …")
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                kravobj = list(pool.map(_hämta, enumerate(dnrs)))
             self.job["_kravobj"] = kravobj
             self.job["kravsum"] = [{
                 "dnr": k["dnr"], "title": k["title"],
@@ -172,15 +179,21 @@ class PipelineJob:
         self.job["done"] = False
         try:
             self.job["phase"] = "analyserar"
-            results = []
             kravobj = self.job["_kravobj"]
-            for i, ko in enumerate(kravobj, 1):
-                self.logg(f"Omgång {i}/{len(kravobj)}: {ko['dnr']}")
-                res = demo_core.analysera(self.job["_company_data"],
-                                          self.job.get("_bolagsfakta"),
-                                          ko["dnr"], progress=self.logg,
-                                          prefetched=ko)
-                results.append(res)
+            cd, bf = self.job["_company_data"], self.job.get("_bolagsfakta")
+
+            def _analysera(pko):
+                i, ko = pko
+                self.logg(f"Omgång {i + 1}/{len(kravobj)}: {ko['dnr']}")
+                return demo_core.analysera(cd, bf, ko["dnr"],
+                                           progress=self.logg, prefetched=ko)
+
+            from concurrent.futures import ThreadPoolExecutor
+            if len(kravobj) > 1:
+                self.logg(f"Bevissöker {len(kravobj)} omgångar parallellt "
+                          f"(3 trådar) …")
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                results = list(pool.map(_analysera, enumerate(kravobj)))
             self.job["results"] = [
                 {k: v for k, v in r.items() if k != "krav"}
                 | {"krav_sample": r["krav"][:200]} for r in results]
@@ -202,7 +215,13 @@ class PipelineJob:
             company = self.job["company"]
             self.job["_excel"] = {}
             self.job["docs"] = {"ansokningar": []}
-            for res in results:
+
+            from concurrent.futures import ThreadPoolExecutor
+            if len(results) > 1:
+                self.logg(f"Skriver dokumenten för {len(results)} omgångar "
+                          f"parallellt (3 trådar) …")
+
+            def _bygg_dok(res):
                 dnr = res["dnr"]
                 self.logg(f"Bygger kravmatris (Excel) — {dnr}")
                 self.job["_excel"][dnr] = demo_core.build_kravmatris_xlsx(
@@ -213,25 +232,31 @@ class PipelineJob:
                 self.logg(f"Skriver ansökningshandling — {dnr}")
                 md = demo_core.build_application_doc(
                     self.job["_company_data"], res, progress=self.logg)
-                self.job["docs"]["ansokningar"].append({
+                self.logg({"kind": "doc_done", "dnr": dnr, "doc": "ansokan",
+                           "title": f"📝 Ansökningshandling {dnr}",
+                           "sub": "utkast för mänsklig granskning"})
+                return {
                     "dnr": dnr, "title": res["title"],
                     "filnamn_md": f"ansokan_{company}_{dnr}.md",
                     "filnamn_xlsx": f"kravmatris_{company}_{dnr}.xlsx",
                     "md": md,
-                })
-                self.logg({"kind": "doc_done", "dnr": dnr, "doc": "ansokan",
-                           "title": f"📝 Ansökningshandling {dnr}",
-                           "sub": "utkast för mänsklig granskning"})
+                }
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                self.job["docs"]["ansokningar"] = \
+                    list(pool.map(_bygg_dok, results))
+
             # --- färska-ögon-granskning, bolagsblind ---
             self.job["phase"] = "granskar"
             self.job["granskning"] = {}
             self.job["_granskning_xlsx"] = {}
-            for res in results:
+
+            def _granska_dok(par):
+                res, a = par
                 dnr = res["dnr"]
-                md = next((a["md"] for a in self.job["docs"]["ansokningar"]
-                           if a["dnr"] == dnr), "")
                 try:
-                    g = demo_core.granska_ansokan(res, md, progress=self.logg)
+                    g = demo_core.granska_ansokan(res, a["md"],
+                                                  progress=self.logg)
                 except Exception as e:  # noqa: BLE001
                     g = {"sammanfattning": f"Granskningen misslyckades: {e}",
                          "punkter": [], "antal": {}}
@@ -244,6 +269,10 @@ class PipelineJob:
                            "sub": f"{len(g['punkter'])} punkter — "
                                   f"{(g.get('antal') or {}).get('blockerare', 0)} "
                                   f"blockerare"})
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                list(pool.map(_granska_dok,
+                              zip(results, self.job["docs"]["ansokningar"])))
             self.job["phase"] = "klar"
         except Exception as e:  # noqa: BLE001
             self._fel(e)

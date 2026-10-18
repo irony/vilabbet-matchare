@@ -96,6 +96,7 @@ export interface Item {
   status?: KravStatus;
   dnr?: string;
   id?: string;
+  n?: number;   // ordinal i omgångens kravlista (req-items)
   doc?: string;
 }
 

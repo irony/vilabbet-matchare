@@ -9,6 +9,8 @@ import re
 import time
 import urllib.request
 
+from concurrent.futures import ThreadPoolExecutor
+
 from vilabbet_client import api_get, api_post, chat, cosine, embed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -86,11 +88,46 @@ def scrape_company(url, name=None, progress=None):
         if u.rstrip("/") == base or PRIO_PAT.search(u.replace(base, "")):
             picked.append(u)
     picked = picked[:MAX_PAGES]
+
+    # fallback för SPA-sajter utan sitemap (t.ex. Next.js-appar där map
+    # bara hittar förstasidan): bredd-först länkkrawl via firecrawls
+    # scrape med links-format — renderas i proxyns headless-browser.
+    if len(picked) < 6:
+        _tell(progress, f"Karta gav bara {len(urls)} sidor — länkkrawl "
+                        f"från förstasidan …")
+        seen.add(base)
+        frontier = [base]
+        puls = 0
+
+        def _länkar(u):
+            try:
+                r = _fc("scrape", {"url": u, "formats": ["markdown", "links"],
+                                   "onlyMainContent": True})
+                return r.get("data") or {}
+            except Exception:  # noqa: BLE001
+                return {}
+
+        while len(picked) < MAX_PAGES and frontier and puls < 6:
+            puls += 1
+            batch, frontier = frontier, []
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                for d in pool.map(_länkar, batch):
+                    for l in (d.get("links") or []):
+                        l = l.split("#")[0].rstrip("/")
+                        if (l.startswith(base) and l not in seen
+                                and not SKIP_PAT.search(l)):
+                            seen.add(l)
+                            picked.append(l)
+                            frontier.append(l)
+        picked = picked[:MAX_PAGES]
+        _tell(progress, f"Länkkrawl samlar {len(picked)} sidor")
+
     _tell(progress, f"Hittade {len(urls)} sidor — skrapar {len(picked)} av dem")
 
-    pages = []
-    for i, u in enumerate(picked, 1):
-        _tell(progress, f"Skrapar sida {i}/{len(picked)} …")
+    pages: list[dict] = [None] * len(picked)  # type: ignore[list-item]
+
+    def _skrapa_en(iu):
+        i, u = iu
         try:
             r = _fc("scrape", {"url": u, "formats": ["markdown"],
                                "onlyMainContent": True})
@@ -99,11 +136,15 @@ def scrape_company(url, name=None, progress=None):
             md = ""
             _tell(progress, f"  kunde inte skrapa {u}: {str(e)[:80]}")
         if md:
-            pages.append({"url": u, "markdown": md[:MAX_MD_PER_PAGE]})
+            pages[i] = {"url": u, "markdown": md[:MAX_MD_PER_PAGE]}
             _tell(progress, f"  ✓ {u.split(dom)[-1] or u} ({len(md)} tecken)",
                   {"kind": "page", "title": u.replace(base, "") or "/",
                    "sub": _first_line(md), "n": len(md)})
-        time.sleep(0.2)
+
+    _tell(progress, f"Skrapar {len(picked)} sidor parallellt (4 trådar) …")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(_skrapa_en, enumerate(picked)))
+    pages = [p for p in pages if p]
     if not pages:
         raise RuntimeError("Kunde inte skrapa någon sida från webbplatsen")
 
@@ -352,9 +393,14 @@ def _korta(text, n=200):
 def fact_find(profil, material, dnr, valda_krav, progress=None, model="default"):
     svar = []
     BATCH = 40
-    for i in range(0, len(valda_krav), BATCH):
-        batch = valda_krav[i:i + BATCH]
-        _tell(progress, f"  krav {i + 1}–{min(i + BATCH, len(valda_krav))} av {len(valda_krav)}")
+    ordinal = {r["requirement_id"]: n + 1
+               for n, r in enumerate(valda_krav)}
+
+    def _kör_batch(i0: int):
+        batch = valda_krav[i0:i0 + BATCH]
+        _tell(progress,
+              f"  krav {i0 + 1}–{min(i0 + BATCH, len(valda_krav))} "
+              f"av {len(valda_krav)}")
         kravlista = "\n".join(
             f'{r["requirement_id"]} [{r.get("type")}]: {_korta(r.get("text"))}'
             for r in batch)
@@ -372,18 +418,27 @@ KRAV ATT BESVARA ({len(batch)} st, omgång {dnr}):
         try:
             parsed = json.loads(content[content.index("["):
                                         content.rindex("]") + 1])
-            svar.extend(parsed)
             by_req = {r["requirement_id"]: r for r in batch}
             for s in parsed:
                 req = by_req.get(s.get("requirement_id"), {})
                 _tell(progress, f"  [{s.get('status')}] {_korta(req.get('text'), 60)}",
                       {"kind": "req", "status": s.get("status", "okant"),
                        "id": s.get("requirement_id"), "dnr": dnr,
+                       "n": ordinal.get(s.get("requirement_id")),
                        "title": _korta(req.get("text"), 95),
                        "sub": _korta(s.get("fakta") or s.get("kommentar")
                                      or f"typ: {req.get('type')}", 90)})
+            return parsed
         except (ValueError, json.JSONDecodeError):
-            pass
+            return []
+
+    batch_starts = list(range(0, len(valda_krav), BATCH))
+    if len(batch_starts) > 1:
+        _tell(progress, f"  kör {len(batch_starts)} kravbatchar parallellt "
+                        f"(3 trådar) för {dnr}")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for parsed in pool.map(_kör_batch, batch_starts):
+            svar.extend(parsed)
     by_id = {s.get("requirement_id"): s for s in svar}
     ut = []
     for r in valda_krav:
