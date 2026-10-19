@@ -351,6 +351,9 @@ Nuvarande gappunkter (toppen):
 
 Regler:
 - Svara kort och sakligt på svenska.
+- Ställ EN fråga åt gången — aldrig numrerade frågelistor. När användaren har
+  svarat på en: bekräfta kort vad du gjort/påverkat, gå sedan till exakt EN
+  nästa fråga (den mest brådskande öppna gapet).
 - Hitta ALDRIG på fakta, namn eller organisationsnummer — använd webbsök/skrapa
   eller bolagssök för att hämta det du saknar, och citera källa (url). Varje
   föreslaget företag MÅSTE verifieras med bolagssök (orgnr) innan du nämner det.
@@ -394,7 +397,11 @@ Regler:
                     argv = json.loads(fn.get("arguments") or "{}")
                 except json.JSONDecodeError:
                     argv = {}
-                res = _kör_verktyg(job, namn, argv, ändrade)
+                try:
+                    res = _kör_verktyg(job, namn, argv, ändrade)
+                except Exception as e:  # noqa: BLE001
+                    res = {"fel": f"verktyget '{namn}' misslyckades: {e}"}
+                    job["log"].append(f"⚠️ agent-verktyg {namn}: {e}")
                 verktygslog.append({"verktyg": namn, "args": argv})
                 messages.append({"role": "tool",
                                  "tool_call_id": tc.get("id"),
@@ -416,3 +423,64 @@ Regler:
     job["log"].append(f"💬 Agent: {len(verktygslog)} verktygsanrop, "
                       f"{len(ändrade)} dokument ändrade")
     return {"svar": svar_text, "verktyg": verktygslog, "ändrade": ändrade}
+
+
+def agent_öppna(job):
+    """Proaktiv öppning när chat-vyn visas första gången: agenten sammanfattar
+    gap-listorna som en kort samtalsinbjudan — vad som saknas, vilka frågor
+    som bör ställas, med gap-stöd-kandidater som förslag direkt i chatten."""
+    chatlog = job.setdefault("chat", [])
+    if chatlog:
+        return None
+    company = job.get("company", "bolaget")
+    # samla gap-punkter över alla dnrs — blockerare och viktiga lägst 30-rader-fok
+    punkter = []
+    for dnr, g in (job.get("granskning") or {}).items():
+        for p in g.get("punkter") or []:
+            if p.get("allvar") in ("blockerare", "viktigt"):
+                punkter.append((dnr, p))
+    punkter.sort(key=lambda dp: (0 if dp[1].get("allvar") == "blockerare" else 1,
+                                 dp[1].get("nr", 99)))
+    rader = []
+    for dnr, p in punkter[:12]:
+        rad = (f"- #{p['nr']} [{p['allvar']}] "
+               f"brist: {demo_core._korta(p.get('beskrivning'), 110)} | "
+               f"åtgärd: {demo_core._korta(p.get('atgard'), 90)}")
+        s = p.get("stöd") or {}
+        if s.get("organisationer"):
+            rad += f" | kandidater: {', '.join(s['organisationer'][:6])}"
+        if s.get("personer"):
+            rad += f" | personer: {', '.join(s['personer'][:3])}"
+        rader.append(rad)
+    gap_text = "\n".join(rader) or "- (inga blockerare/viktiga gap hittade)"
+    system = f"""Du börjar precis din första konversation med representanten
+för {company}. De har precis fått ett ansökningsutkast, en kravmatris och en
+gap-lista per Vinnova-omgång valda för dem. Nu är det din uppgift att
+presentera det snabbt och driva samtalet mot att STYDA gap-listorna.
+
+Skriv ett öppningsmeddelande (svenska, ≤220 ord) som:
+1. Välkomnar och enradigt säger vad som ligger framför dem (ansökan,
+   kravmatris, gap-lista — och att du kan ändra i alla direkt).
+2. Nämner de 3–4 MEST brådskande gapen ÖVERSIKTLIGT (max en rad per gap,
+   vanlig text) — som sammanhang, INTE som frågelista. Nämna kort
+   gap-stöd-kandidater (organisationer/personer) där de finns.
+3. Ställ sedan EXAKT EN konkret fråga — den mest brådskande först (oftast
+   konsortiepartner eller sökt belopp), gärna med förslag rakt i frågan
+   ("vill du ha Leonh AB eller Nordea?").
+4. Slutar med en stödjande inbjudan: "vi tar dem en i taget — jag ändrar
+   i dokumenten direkt när du svarar".
+
+GAPEN (i prioritetsordning):
+{gap_text}"""
+    try:
+        data = _berget_chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": "Skriv öppningsmeddelandet nu."}],
+            max_tokens=600)
+        text = (data["choices"][0].get("message") or {}).get("content") or ""
+    except Exception as e:  # noqa: BLE001
+        text = (f"Hej! Jag hittade ett antal gap i ansökningsutkastet för "
+                f"{company}. (Agentens öppning kunde inte nås: {e}). Svara gärna "
+                "en i taget — jag ändrar i dokumenten direkt.")
+    chatlog.append({"roll": "assistent", "innehåll": text, "öppning": True})
+    return {"svar": text}

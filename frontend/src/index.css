@@ -25,3 +25,28 @@ body {
   color: var(--color-ink);
 }
 h1, h2, h3 { font-family: var(--font-display); font-weight: 600; }
+
+/* ── Mörkt tema (?theme=dark) — används vid inbäddning i slides ──────────
+   Strategi: flippa de semantiska variablerna. bg-white lämnas orörd i
+   ljust läge men fångas upp av en egen regel nedan (olagerad CSS vinner
+   över Tailwinds lager) så att ytor blir mörka utan att text-white rörs. */
+:root[data-theme="dark"] {
+  --color-background: #0b0e0c;
+  --color-ink: #e6ece8;
+  --color-muted: #93a59b;
+  --color-accent: #2e6b52;
+  --color-accent-soft: #14251d;
+  --color-line: #2a3a32;
+  --color-ok: #4ade80;
+  --color-ok-soft: #12301c;
+  --color-warm: #fbbf24;
+  --color-warm-soft: #2e2410;
+  --color-bad: #f87171;
+  --color-bad-soft: #331414;
+}
+
+/* ytor som är hårdkodat ljusa i komponenterna */
+:root[data-theme="dark"] .bg-white { background-color: #101a15; }
+:root[data-theme="dark"] .bg-slate-100 { background-color: #1a2921; }
+:root[data-theme="dark"] .bg-\[\#eeebe4\] { background-color: #1a2921; }
+:root[data-theme="dark"] .hover\:bg-\[\#eeebe4\]:hover { background-color: #1a2921; }

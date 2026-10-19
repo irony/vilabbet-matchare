@@ -3,6 +3,8 @@ import { Api, type BolagTraff } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/select";
+import DictateButton from "@/components/DictateButton";
+import { tillAdress } from "@/lib/diktera";
 
 interface Gissning { namn: string; hits: BolagTraff[] }
 
@@ -11,6 +13,8 @@ const MAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 export default function StartScreen({
   onStart,
 }: { onStart: (url: string, orgnr: string | null, email: string | null) => void }) {
+  // inbäddningsläge (?ren=1): kort copy, inga steg-chips
+  const ren = new URLSearchParams(window.location.search).get("ren") === "1";
   // mejl först — domänen avslöjar bolaget; privat domän → fråga om webbadress
   const [mode, setMode] = useState<"email" | "url">("email");
   const [email, setEmail] = useState("");
@@ -101,6 +105,8 @@ export default function StartScreen({
     setTraffar([]);
     setConfirm(`⚖️ ${t.namn} — bekräftat från Bolagsverkets register`);
     setFrågaVisad(false);
+    // förvärm: starta sid-crawlen redan här, medan användaren trycker Nästa
+    if (domän) Api.prefetch(domän);
   };
 
   const domän = mode === "email" ? (mailDomän ?? "") : url.trim().replace(/^https?:\/\//, "").replace(/^www\./, "");
@@ -123,30 +129,34 @@ export default function StartScreen({
         Vi skriver er ansökan om innovationsstöd — automatiskt
       </h1>
       <p className="mt-4 max-w-[640px] text-[16.5px] leading-relaxed text-[color:var(--color-muted)]">
-        Åtminstone ett ordentligt utkast. Ni skriver in din arbetsmail — så hittar vi
-        bolaget, matchar det mot alla 303 öppna utlysningar från Vinnova, Formas m.fl.,
-        kollar varje krav mot er webbplats och tar fram kravmatris, ansökningsutkast
-        och en granskning med färska ögon. Ni granskar, kompletterar — och skickar in.
+        {ren
+          ? "Skriv in din arbetsmail — vi hittar bolaget, matchar det mot 303 öppna utlysningar och skriver ett ordentligt utkast. Ni granskar och skickar in."
+          : "Åtminstone ett ordentligt utkast. Ni skriver in din arbetsmail — så hittar vi bolaget, matchar det mot alla 303 öppna utlysningar från Vinnova, Formas m.fl., kollar varje krav mot er webbplats och tar fram kravmatris, ansökningsutkast och en granskning med färska ögon. Ni granskar, kompletterar — och skickar in."}
       </p>
-      <div className="mt-5 flex flex-wrap gap-2">
-        {["1 · Hitta rätt utlysning", "2 · Beviskolla kraven", "3 · Klart utkast + granskning"].map((s) => (
-          <span key={s} className="rounded-full border border-[color:var(--color-line)] bg-white px-3.5 py-1.5 text-[13px] text-[color:var(--color-muted)]">
-            {s}
-          </span>
-        ))}
-      </div>
+      {!ren && (
+        <div className="mt-5 flex flex-wrap gap-2">
+          {["1 · Hitta rätt utlysning", "2 · Beviskolla kraven", "3 · Klart utkast + granskning"].map((s) => (
+            <span key={s} className="rounded-full border border-[color:var(--color-line)] bg-white px-3.5 py-1.5 text-[13px] text-[color:var(--color-muted)]">
+              {s}
+            </span>
+          ))}
+        </div>
+      )}
       <div className="mt-8 flex flex-col gap-4">
         {mode === "email" && (
-          <Input
-            value={email}
-            onChange={(e) => { setEmail(e.target.value); setConfirm(null); setFrågaVisad(false); setMailDomän(null); }}
-            onKeyDown={(e) => e.key === "Enter" && redo && go()}
-            placeholder="du@dittbolag.se"
-            type="email"
-            className="max-w-[560px] !text-[21px] !rounded-none !border-0 !border-b-2 !px-1.5 !py-2.5"
-            autoFocus
-            enterKeyHint="go"
-          />
+          <div className="flex max-w-[560px] items-center gap-2">
+            <Input
+              value={email}
+              onChange={(e) => { setEmail(e.target.value); setConfirm(null); setFrågaVisad(false); setMailDomän(null); }}
+              onKeyDown={(e) => e.key === "Enter" && redo && go()}
+              placeholder="du@dittbolag.se"
+              type="email"
+              className="flex-1 !text-[21px] !rounded-none !border-0 !border-b-2 !px-1.5 !py-2.5"
+              autoFocus
+              enterKeyHint="go"
+            />
+            <DictateButton onText={(t) => setEmail(t)} transform={tillAdress} />
+          </div>
         )}
         {privvarning && (
           <p className="text-[13px] text-[color:var(--color-warm)]">
@@ -154,15 +164,18 @@ export default function StartScreen({
           </p>
         )}
         {mode === "url" && (
-          <Input
-            value={url}
-            onChange={(e) => { setUrl(e.target.value); setConfirm(null); }}
-            onKeyDown={(e) => e.key === "Enter" && url.trim() && go()}
-            placeholder="t.ex. dittbolag.se"
-            className="max-w-[560px] !text-[21px] !rounded-none !border-0 !border-b-2 !px-1.5 !py-2.5"
-            autoFocus
-            enterKeyHint="go"
-          />
+          <div className="flex max-w-[560px] items-center gap-2">
+            <Input
+              value={url}
+              onChange={(e) => { setUrl(e.target.value); setConfirm(null); }}
+              onKeyDown={(e) => e.key === "Enter" && url.trim() && go()}
+              placeholder="t.ex. dittbolag.se"
+              className="flex-1 !text-[21px] !rounded-none !border-0 !border-b-2 !px-1.5 !py-2.5"
+              autoFocus
+              enterKeyHint="go"
+            />
+            <DictateButton onText={(t) => setUrl(t)} transform={tillAdress} />
+          </div>
         )}
         {gissar && (
           <p className="flex items-center gap-2 text-[13px] text-[color:var(--color-muted)]">
@@ -195,13 +208,16 @@ export default function StartScreen({
           </div>
         )}
         <div className="relative max-w-[480px]">
-          <Input
-            value={orgnr}
-            onChange={(e) => { setOrgnr(e.target.value); setConfirm(null); }}
-            placeholder="bolagsnamn eller org.nr 556xxx-xxxx (autocomplete)"
-            className="!text-[15px]"
-            onKeyDown={(e) => e.key === "Enter" && redo && go()}
-          />
+          <div className="flex items-center gap-2">
+            <Input
+              value={orgnr}
+              onChange={(e) => { setOrgnr(e.target.value); setConfirm(null); }}
+              placeholder="bolagsnamn eller org.nr 556xxx-xxxx (autocomplete)"
+              className="flex-1 !text-[15px]"
+              onKeyDown={(e) => e.key === "Enter" && redo && go()}
+            />
+            <DictateButton onText={(t) => setOrgnr((v) => (v ? `${v.trimEnd()} ${t}` : t))} />
+          </div>
           {traffar.length > 0 && (
             <div className="absolute left-0 right-0 top-[calc(100%+5px)] z-20 overflow-hidden rounded-xl border-[1.5px] border-[color:var(--color-line)] bg-white shadow-xl">
               {traffar.map((t) => (

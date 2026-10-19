@@ -57,6 +57,13 @@ export default function SummaryScreen({
         <Button onClick={onNext}>Stämmer — visa mina utlysningar ↵</Button>
         <Button variant="outline" onClick={onRestart}>Börja om</Button>
       </div>
+      {job.phase === "matchar" && (
+        <p className="mt-4 flex items-center gap-2 text-[12.5px] text-[color:var(--color-muted)]">
+          <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-[color:var(--color-accent)] border-t-transparent" />
+          Medan du läser: AI:n matchar er profil mot 303 öppna utlysningar i
+          bakgrunden — träfflistan är redo när du klickar vidare.
+        </p>
+      )}
       <p className="mt-5 text-[12.5px] text-[color:var(--color-muted)]">{kalla}</p>
     </div>
   );

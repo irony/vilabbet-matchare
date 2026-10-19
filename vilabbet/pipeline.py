@@ -24,11 +24,14 @@ Faser (job["phase"]):
 """
 import os
 import sys
+import time
 import traceback
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import demo_core  # noqa: E402
+import prefetch  # noqa: E402
+from prefetch import KRAV_ANTAL_PREFETCH  # noqa: E402
 
 PHASES = ("startad", "skrapar", "matchar", "valet", "hamtar_krav", "kravsum",
           "analyserar", "bevissum", "dokumenterar", "granskar", "klar", "fel")
@@ -85,10 +88,23 @@ class PipelineJob:
     # ------------------------------------------------------- steg
     def börja(self, url, orgnr=None):
         """Skrapar webbplatsen, bygger bolagsprofil och matchar mot 303
-        omgångar. Slutfas: 'valet'."""
+        omgångar. Slutfas: 'valet'. Om crawlingen redan körde i
+        bakgrunden (prefetch vid orgnr-valet) återanvänds den samma data
+        — och samma progress-händelser matas in i jobbet i samma ordning
+        så processvyn hålls sant."""
         try:
             self.job["phase"] = "skrapar"
-            data = demo_core.scrape_company(url, progress=self.logg)
+            hit = prefetch.crawl_hämta(url)
+            if hit:
+                färdiga_tid = time.time() - hit["ts"]
+                self.logg(f"Webbsidorna var redan skrapade i bakgrunden "
+                          f"(tog {färdiga_tid:.0f} s — men du behövde "
+                          f"inte vänta 🎉)")
+                for ev in hit["events"]:
+                    self.logg(ev)
+                data = hit["data"]
+            else:
+                data = demo_core.scrape_company(url, progress=self.logg)
             self.job["company"] = data["company"]
             self.job["profil"] = data["profil"]
             self.job["_company_data"] = data
@@ -116,6 +132,14 @@ class PipelineJob:
             self.job["phase"] = "matchar"
             self.job["matches"] = demo_core.match_rounds(
                 data["profil"], max_results=15, progress=self.logg)
+            # Medan användaren granskar sammanfattningen: förhämta kraven
+            # för topp-N matchningar i bakgrunden. välj() återanvänder
+            # cache-träffar direkt.
+            startade = prefetch.krav_starta(
+                [m["dnr"] for m in self.job["matches"]])
+            if startade:
+                self.logg(f"Hämtar kraven för topp-{KRAV_ANTAL_PREFETCH} "
+                          f"i bakgrunden medan du granskar sammanfattningen …")
             self.job["phase"] = "valet"
         except Exception as e:  # noqa: BLE001
             self._fel(e)
@@ -132,8 +156,19 @@ class PipelineJob:
 
             def _hämta(pd):
                 i, dnr = pd
-                self.logg(f"Hämtar krav {i + 1}/{len(dnrs)}: {dnr}")
-                ko = demo_core.hämta_kravobj(dnr, progress=self.logg)
+                hit = prefetch.krav_hämta(dnr)
+                if hit:
+                    # redan hämtat i bakgrunden medan användaren granskade
+                    # sammanfattningen — spela in samma händelseström i
+                    # jobb-loggen (processvyn hålls sann) utan väntetid.
+                    self.logg(f"Krav {i + 1}/{len(dnrs)}: {dnr} — ✓ hämtat "
+                              f"klart i bakgrunden under sammanfattningen")
+                    for ev in hit["events"]:
+                        self.logg(ev)
+                    ko = hit["ko"]
+                else:
+                    self.logg(f"Hämtar krav {i + 1}/{len(dnrs)}: {dnr}")
+                    ko = demo_core.hämta_kravobj(dnr, progress=self.logg)
                 if self.job.get("matches"):
                     m = next((m for m in self.job["matches"]
                               if m["dnr"] == dnr), None)

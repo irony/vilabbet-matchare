@@ -80,6 +80,7 @@ export interface GranskningsPunkt {
   avsnitt?: string;
   beskrivning: string;
   atgard: string;
+  fråga?: string;
   stöd?: {
     fynd?: { sida?: string; citat?: string; kommentar?: string }[];
     personer?: string[];
@@ -187,6 +188,13 @@ export const Api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, orgnr, email }),
     }),
+  // förvärm crawl-cachen så fort användaren valt sitt bolag — fire & forget
+  prefetch: (url: string) => {
+    fetch(`/api/prefetch`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    }).catch(() => {});
+  },
   frånMail: (email: string) =>
     api<FrånMailSvar>("/från_mail", {
       method: "POST",

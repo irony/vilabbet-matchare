@@ -25,11 +25,15 @@ def _request(url, token, data=None, timeout=60, retries=3):
         except urllib.error.HTTPError as e:
             detail = e.read().decode()[:300]
             if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                print(f"[vilabbet_client] HTTP {e.code} {url} — försök "
+                      f"{attempt + 1}/{retries}, väntar {2 * (attempt + 1)}s")
                 time.sleep(2 * (attempt + 1))
                 continue
             raise RuntimeError(f"HTTP {e.code} {url}: {detail}") from e
-        except (TimeoutError, ConnectionError, urllib.error.URLError):
+        except (TimeoutError, ConnectionError, urllib.error.URLError) as e:
             if attempt < retries - 1:
+                print(f"[vilabbet_client] {type(e).__name__} {url} — försök "
+                      f"{attempt + 1}/{retries}, väntar {2 * (attempt + 1)}s")
                 time.sleep(2 * (attempt + 1))
                 continue
             raise

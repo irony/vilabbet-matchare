@@ -36,6 +36,13 @@ export default function PickScreen({
       <p className="mt-2 text-[15px] text-[color:var(--color-muted)]">
         Kryssa för upp till tre omgångar så analyserar vi kraven och letar bevis i din textmassa.
       </p>
+      {!job.matches?.length && (
+        <div className="mt-6 flex items-center gap-3 rounded-2xl border border-dashed border-[color:var(--color-line)] bg-white/60 px-5 py-6 text-[14.5px] text-[color:var(--color-muted)]">
+          <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-[color:var(--color-accent)] border-t-transparent" />
+          Matchningen mot de 303 öppna utlysningarna kör fortfarande i
+          bakgrunden — träffarna landar här automatiskt om några sekunder.
+        </div>
+      )}
       <div className="mt-6 grid gap-3 md:grid-cols-2">
         {(job.matches ?? []).map((m) => {
           const poang = Math.round(m.matchpoang ?? (m.similarity ?? 0) * 100);

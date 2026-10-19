@@ -19,19 +19,30 @@ import sys
 import threading
 import traceback
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import demo_core  # noqa: E402
+import prefetch  # noqa: E402
 from vilabbet import PipelineJob  # noqa: E402
 from vilabbet.pipeline import new_job_state, public_view  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 app = FastAPI(title="Utlysningsmatchning — demo")
+
+
+@app.middleware("http")
+async def _no_cache_demo_html(request, call_next):
+    """Demo-appens html får aldrig cachelagras — slides hämtar rätt bundle
+    alltid, även mellan scen-genomkörningar under samma timme."""
+    resp = await call_next(request)
+    if request.url.path == "/app/" or request.url.path.endswith(".html"):
+        resp.headers["cache-control"] = "no-store"
+    return resp
 
 JOBS = {}
 
@@ -115,6 +126,21 @@ def start(inp: StartIn):
     pj = PipelineJob(job)
     _run_in_thread(pj.börja, inp.url, inp.orgnr)
     return {"job_id": jid, "phase": "skrapar"}
+
+
+class PrefetchIn(BaseModel):
+    url: str
+
+
+@app.post("/api/prefetch")
+def api_prefetch(inp: PrefetchIn):
+    """Starta sid-crawlen i bakgrunden så fort användaren valt sitt bolag
+    (orgnr) i förstaskärmen. /api/start återanvänder cachen direkt."""
+    url = inp.url
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    startade = prefetch.crawl_starta(url)
+    return {"ok": True, "startade": startade, "cache": "träff" if not startade else "miss"}
 
 
 @app.get("/api/bolag")
@@ -340,6 +366,19 @@ def chatt(inp: ChatIn):
     return agent_core.agent_svara(job, inp.meddelande.strip())
 
 
+@app.post("/api/chat/open")
+def chat_open(inp: JobIn):
+    job = _job_or_404(inp)
+    if job["phase"] != "klar":
+        raise HTTPException(409, f"öppningen är förberedd för fas 'klar', "
+                                 f"jobbet är i '{job['phase']}'")
+    if not (job.get("granskning") or {}):
+        return {"svar": None}
+    import agent_core
+    s = agent_core.agent_öppna(job)
+    return s or {"svar": None}
+
+
 @app.post("/api/fortsatt")
 def fortsatt(inp: JobIn):
     job = _job_or_404(inp)
@@ -447,6 +486,56 @@ def feedback(inp: FeedbackIn):
     return {"ok": True, "svar": n}
 
 
+@app.websocket("/api/realtime")
+async def realtime_relä(ws: WebSocket):
+    """Relä till Bergets realtime-transkribering (klang/pianissimo).
+
+    Webbläsare kan inte sätta Authorization-header på en WebSocket, så
+    dikteringsknappen ansluter hit — servern har nyckeln i miljön och
+    skickar vidare alla meddelanden i båda riktningarna."""
+    await ws.accept()
+    key = os.environ.get("BERGET_API_KEY")
+    if not key:
+        await ws.close(code=1011)
+        return
+    import asyncio
+
+    import websockets
+
+    modell = ws.query_params.get("model", "klang/pianissimo")
+    url = f"wss://api.berget.ai/v1/realtime?model={modell}"
+    try:
+        async with websockets.connect(
+            url,
+            additional_headers={
+                "Authorization": f"Bearer {key}",
+                "OpenAI-Beta": "realtime=v1",
+            },
+        ) as upp:
+            async def åt_servern():
+                try:
+                    while True:
+                        await upp.send(await ws.receive_text())
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
+
+            async def åt_klienten():
+                try:
+                    async for meddelande in upp:
+                        await ws.send_text(meddelande)
+                except Exception:
+                    pass
+
+            await asyncio.gather(åt_servern(), åt_klienten())
+    except Exception:
+        try:
+            await ws.close(code=1011)
+        except Exception:
+            pass
+
+
 @app.get("/api/download/{jid}/excel/{dnr}.xlsx")
 def dl_excel(jid: str, dnr: str):
     job = JOBS.get(jid)
@@ -533,8 +622,8 @@ def _eo_ladda_upp(job: dict, kind: str, dnr: str) -> str | None:
     jobbet så vi kan slå ihop redigeringar senare. Returnerar editor-toolsets fileId."""
     spår = job.setdefault("_eo_files", {})
     nyckel = f"{kind}:{dnr}"
-    if nyckel in spår:
-        return spår[nyckel]["filename"]
+    # eurooffices example-lagring är flyktig — alltid ladda upp på nytt
+    # så editorn aldrig stöter på en död filreferens efter serverrens
     data, _ft, _mim, namn = _doc_bytes(job, kind, dnr)
     if not data:
         return None
